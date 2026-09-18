@@ -1,0 +1,24 @@
+[package]
+name = "opencode-warp-tui"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Standalone Warp-style agent TUI foundation (mock backend; OpenCode adapter lands in a later phase)"
+authors = ["opencode-warp-tui contributors"]
+
+[[bin]]
+name = "owt"
+path = "src/main.rs"
+
+[dependencies]
+# MIT-licensed Warp UI framework (attribution in NOTICE.md). Pinned to the
+# exact revision mapped in Phase 1 so the promoted Warp snapshots compile
+# against the APIs they were written for. AGPL-3.0-only applies to this crate
+# overall because it also compiles AGPL warp_tui snapshots and transitively
+# depends on AGPL workspace crates (warp_errors, warp_util, markdown_parser).
+warpui_core = { git = "https://github.com/warpdotdev/warp.git", rev = "1bf1c6a2b36bdbb977ad40a380c841182f2995fb", features = ["tui"] }
+instant = "0.1"
+log = "0.4"
+serde_json = "1"
+unicode-segmentation = "1"
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
