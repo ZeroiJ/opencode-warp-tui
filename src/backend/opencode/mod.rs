@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use super::stream::apply_event;
 use super::{
+    memory::{api::ListFilter, command, MemoryApi},
     AgentStatus, Backend, Block, Blocker, SessionSummary, SlashCommand, StatusInfo, StreamEvent,
 };
 use client::{Client, ClientError};
@@ -77,6 +78,10 @@ pub struct OpenCodeBackend {
     _worker: SseWorker,
     _server: Option<PrivateServer>,
     _connection: ConnectionKind,
+    /// Memory engine (Phase 5): `/memory` commands are handled entirely
+    /// locally; the session never sees them. Infallible to construct — a
+    /// store failure disables memory, never the connection.
+    memory: MemoryApi,
 }
 
 #[derive(Debug)]
@@ -104,6 +109,16 @@ impl OpenCodeBackend {
         client.health().map_err(ConnectError::Client)?;
         let (sender, receiver) = std::sync::mpsc::channel::<RawEvent>();
         let worker = Self::subscribe(&endpoint, sender);
+        // Phase 5: build the local memory engine. Infallible — failure is
+        // logged and remembered (memory commands then report errors, but the
+        // connection proceeds).
+        let memory = MemoryApi::open(
+            super::memory::store::user_store_dir(),
+            config
+                .project_dir
+                .clone()
+                .or_else(|| std::env::current_dir().ok()),
+        );
         let mut backend = Self {
             state: Arc::new(Mutex::new(State::default())),
             client,
@@ -111,6 +126,7 @@ impl OpenCodeBackend {
             _worker: worker,
             _server: server,
             _connection: kind,
+            memory,
         };
         backend.initial_load()?;
         Ok(backend)
@@ -467,34 +483,13 @@ impl Backend for OpenCodeBackend {
         if trimmed.is_empty() {
             return;
         }
-        let Some(id) = self.with_state(|state| state.active_id()) else {
-            return;
-        };
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .blocks
-                .entry(id.clone())
-                .or_default()
-                .push(Block::User {
-                    text: trimmed.clone(),
-                });
-        }
-        match self.client.send_prompt(&id, &trimmed) {
-            Ok(_) => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.busy.insert(id);
-                }
-            }
-            Err(error) => {
-                log::warn!("prompt rejected: {error}");
-                if let Ok(mut state) = self.state.lock() {
-                    if let Some(blocks) = state.blocks.get_mut(&id) {
-                        blocks.push(Block::Error {
-                            text: format!("Prompt rejected: {error}"),
-                        });
-                    }
-                }
-            }
+        match command::classify(&trimmed) {
+            // `\/memory …` → forward literally (backslash consumed); the
+            // agent sees ordinary text, never a memory command.
+            command::Classified::Escaped => self.submit_prompt(&trimmed[1..]),
+            // `/memory …` / `/mem …` → handled locally, answered in-band.
+            command::Classified::Command => self.run_memory_command(&trimmed),
+            command::Classified::Normal => self.submit_prompt(&trimmed),
         }
     }
 
@@ -653,6 +648,144 @@ impl Backend for OpenCodeBackend {
         // Worker events arrive continuously while a turn runs; the pump
         // repaints while the active session is busy.
         self.with_state(|state| state.active_id().is_some_and(|id| state.busy.contains(&id)))
+    }
+}
+
+impl OpenCodeBackend {
+    /// The ordinary prompt path: echo the User block, then send.
+    fn submit_prompt(&mut self, text: &str) {
+        let Some(id) = self.with_state(|state| state.active_id()) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .blocks
+                .entry(id.clone())
+                .or_default()
+                .push(Block::User {
+                    text: text.to_owned(),
+                });
+        }
+        match self.client.send_prompt(&id, text) {
+            Ok(_) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.busy.insert(id);
+                }
+            }
+            Err(error) => {
+                log::warn!("prompt rejected: {error}");
+                if let Ok(mut state) = self.state.lock() {
+                    if let Some(blocks) = state.blocks.get_mut(&id) {
+                        blocks.push(Block::Error {
+                            text: format!("Prompt rejected: {error}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// `/memory` handling: echo the typed line, run the engine, reply
+    /// in-band (Assistant on success, Error on failure). The prompt never
+    /// reaches OpenCode; a memory failure never takes the session down.
+    fn run_memory_command(&mut self, text: &str) {
+        let Some(id) = self.with_state(|state| state.active_id()) else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .blocks
+                .entry(id.clone())
+                .or_default()
+                .push(Block::User {
+                    text: text.to_owned(),
+                });
+        }
+        let reply = self.memory_reply(&id, text);
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(blocks) = state.blocks.get_mut(&id) {
+                blocks.push(reply);
+            }
+        }
+    }
+
+    /// Build the in-band reply block for a classified `/memory` command.
+    fn memory_reply(&mut self, session_id: &str, text: &str) -> Block {
+        match command::parse(command::prefix_remainder(text)) {
+            Err(message) => Block::Error {
+                text: format!("memory: {message}"),
+            },
+            Ok(command::Command::Help) => Block::Assistant {
+                text: command::help_text().to_owned(),
+            },
+            Ok(command::Command::Remember(args)) => match self.memory.remember(session_id, &args) {
+                Ok(result) => Block::Assistant {
+                    text: command::written_reply("stored", &result),
+                },
+                Err(error) => Block::Error {
+                    text: format!("memory: {error}"),
+                },
+            },
+            Ok(command::Command::Update(args)) => match self.memory.update(session_id, &args) {
+                Ok(result) => Block::Assistant {
+                    text: command::written_reply("updated", &result),
+                },
+                Err(error) => Block::Error {
+                    text: format!("memory: {error}"),
+                },
+            },
+            Ok(command::Command::Forget { handle, scope }) => {
+                match self.memory.forget(&handle, scope) {
+                    Ok(outcome) => Block::Assistant {
+                        text: command::forget_reply(&outcome),
+                    },
+                    Err(error) => Block::Error {
+                        text: format!("memory: {error}"),
+                    },
+                }
+            }
+            Ok(command::Command::Pin {
+                handle,
+                pinned,
+                scope,
+            }) => match self.memory.set_pinned(&handle, pinned, scope) {
+                Ok(record) => Block::Assistant {
+                    text: command::pin_reply(&record, pinned),
+                },
+                Err(error) => Block::Error {
+                    text: format!("memory: {error}"),
+                },
+            },
+            Ok(command::Command::List {
+                scope,
+                kind,
+                pinned,
+            }) => {
+                let filter = ListFilter {
+                    scope,
+                    kind,
+                    pinned,
+                };
+                match self.memory.list(&filter) {
+                    Ok(records) => Block::Assistant {
+                        text: command::list_reply(&records),
+                    },
+                    Err(error) => Block::Error {
+                        text: format!("memory: {error}"),
+                    },
+                }
+            }
+            Ok(command::Command::Show { handle, all, scope }) => {
+                match self.memory.show(&handle, all, scope) {
+                    Ok(records) => Block::Assistant {
+                        text: command::show_reply(&records, &handle),
+                    },
+                    Err(error) => Block::Error {
+                        text: format!("memory: {error}"),
+                    },
+                }
+            }
+        }
     }
 }
 

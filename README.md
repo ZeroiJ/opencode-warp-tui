@@ -4,10 +4,11 @@ A standalone experimental TUI project intended to reproduce/adapt the useful
 interaction and presentation patterns of Warp's CLI/agent interface while using
 OpenCode as the eventual backend.
 
-> **Status: PHASE 2 — standalone foundation on a mock backend.**
-> The crate compiles to a working TUI (`cargo run`, binary `owt`) that renders
-> Warp-style sessions from scripted mock data. NOT connected to OpenCode yet
-> (no SDK, no API calls); the OpenCode adapter lands in a later phase.
+> **Status: PHASE 5 — memory engine foundation.**
+> The crate compiles to a working TUI (`cargo run`, binary `owt`) with a
+> live `OpenCodeBackend` behind the generic `Backend` trait (mock is default)
+> and a local memory engine (`/memory` commands, JSONL storage). Memory is
+> **not** injected into any session yet — that lands in Phase 6.
 
 ## Layout
 
@@ -25,7 +26,8 @@ OpenCode as the eventual backend.
 │   │   ├── mod.rs       # Backend trait + session/block models
 │   │   ├── stream.rs    # shared StreamEvent applier (mock + adapter)
 │   │   ├── mock.rs      # scripted MockBackend (validation only)
-│   │   └── opencode/    # live adapter (client/config/events/mapper)
+│   │   ├── opencode/    # live adapter (client/config/events/mapper)
+│   │   └── memory/      # Phase-5 memory engine (api/store/record/key/…)
 │   └── tui/
 │       ├── session.rs   # session surface (tabs, transcript, menu, prompt, statusline)
 │       ├── transcript.rs# block → Warp-styled rows + markdown-lite
@@ -44,7 +46,8 @@ OpenCode as the eventual backend.
 │   ├── phase3.md            # Phase-3 decisions, changes, verification
 │   ├── phase4.md            # Phase-4 adapter, mappings, integration results
 │   ├── opencode-architecture.md  # OpenCode API/event findings with sources
-│   └── keymap.md            # verified key bindings
+│   ├── keymap.md            # verified key bindings
+│   └── memory/              # Phase-2B memory architecture (D15–D25)
 └── warp-tui/            # pristine Phase-1 reference snapshots (frozen)
     ├── NOTICE.md
     └── src/             # 7 presentation-only files, unmodified
@@ -74,17 +77,20 @@ mouse wheel / `pgup/pgdn` to scroll, `ctrl-c` (×2) to exit.
 2. **Phase 2:** standalone compilable foundation on mock data. ✅
 3. **Phase 3:** hardened frontend — streaming pump, multiline input,
    hosted Warp tab strip, clean backend boundary. ✅
-4. **Phase 4 (this):** OpenCode adapter — `OpenCodeBackend` speaks to a live
+4. **Phase 4:** OpenCode adapter — `OpenCodeBackend` speaks to a live
    server through the same generic trait (`--backend opencode`; default stays
    mock). ✅
-2. Phase 2: make the extracted TUI compile independently.
-3. Phase 3: remove Warp-specific backend dependencies.
-4. Phase 4: create a clean backend interface.
-5. Phase 5: implement an OpenCode backend adapter (official/current SDK/API).
-6. Phase 6: connect sessions, messages, tool calls, streaming, permissions, files.
-7. Phase 7: reproduce the Warp/Claude-Code/Devin interaction model.
-8. Phase 8: UX, keyboard navigation, layout, performance, accessibility.
-9. Phase 9: package as a standalone OpenCode TUI frontend.
-10. Phase 10: installation and update instructions.
+5. **Phase 5 (current):** Memory Engine Foundation — `MemoryApi` +
+   `MemoryStore` + JSONL persistence (`$XDG_DATA_HOME/owt/` + `<root>/.owt/`),
+   secret refusal, `/memory`/`/mem` command routing. ✅
+6. **Phase 6:** OpenCode memory integration (context builder + injection gate,
+   frozen single `owt.memory` block at session start).
+7. **Phase 7:** full agent interaction (questions, permissions, tools, diff,
+   cancel, errors, history, reconnect).
+8. **Phase 8:** memory intelligence (extraction, consolidation, hybrid
+   retrieval, confidence, decay).
+9. **Phase 9:** TUI memory UX (memory browsing from the interface).
+10. **Phase 10:** production hardening (performance, persistence, crash
+    recovery, migrations, security, version compat).
 
-Do NOT proceed to Phase 2 without explicit instruction.
+Phase boundaries are strict: no phase starts without explicit authorization.

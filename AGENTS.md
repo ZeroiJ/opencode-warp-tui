@@ -44,9 +44,10 @@ isolated from the TUI layer until its dedicated phase.
 
 ## Phase discipline
 
-* Only the current authorized phase may be worked on. Today: **Phase 4**
-  (OpenCode adapter foundation; live-server *reads* only for interface
-  discovery/testing — no global config changes).
+* Only the current authorized phase may be worked on. Today: **Phase 5**
+  (Memory Engine Foundation: Memory API + `MemoryStore` + JSONL persistence
+  + `/memory` command routing; **no memory injection** into any session —
+  that is Phase 6; no OpenCode/global config changes).
 * `warp-tui/src/` files are pristine Phase-1 AGPL-3.0-only reference snapshots
   (see `research/licensing.md`, `warp-tui/NOTICE.md`). Do not modify them;
   the compilable promotions live under `src/tui/widgets/` (see

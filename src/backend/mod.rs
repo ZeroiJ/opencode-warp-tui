@@ -5,6 +5,7 @@
 //! into it. Phase 2 ships only the [`MockBackend`](mock::MockBackend); the
 //! OpenCode adapter implements this same trait in a later phase.
 
+pub mod memory;
 pub mod mock;
 pub mod opencode;
 pub mod stream;
