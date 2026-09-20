@@ -11,6 +11,8 @@ use std::time::Duration;
 pub const ENV_SERVER_URL: &str = "OPENCODE_SERVER_URL";
 pub const ENV_SERVER_PASSWORD: &str = "OPENCODE_SERVER_PASSWORD";
 pub const ENV_OPENCODE_BIN: &str = "OPENCODE_BIN";
+/// Memory injection gate (`memory.injection = auto | off`).
+pub const ENV_MEMORY_INJECTION: &str = "OWT_MEMORY_INJECTION";
 
 /// Where OpenCode records its managed background service.
 fn service_registration_path() -> Option<PathBuf> {
@@ -63,8 +65,27 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Memory injection gate (Phase 6B): `auto` attempts session-start
+/// injection when the server supports it; `off` skips probe + PUT entirely
+/// and the session behaves exactly as Phase 5 did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryInjection {
+    #[default]
+    Auto,
+    Off,
+}
+
+impl MemoryInjection {
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "no" => MemoryInjection::Off,
+            _ => MemoryInjection::Auto,
+        }
+    }
+}
+
 /// Adapter configuration, resolved in `connect()`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OpenCodeConfig {
     /// Explicit server URL (`` env). Skips discovery + spawn.
     pub server_url: Option<String>,
@@ -74,6 +95,20 @@ pub struct OpenCodeConfig {
     pub project_dir: Option<PathBuf>,
     /// `opencode` binary override (`` env, else `PATH` lookup).
     pub binary: Option<String>,
+    /// Memory injection gate (`` env, default `auto`).
+    pub injection: MemoryInjection,
+}
+
+impl Default for OpenCodeConfig {
+    fn default() -> Self {
+        Self {
+            server_url: None,
+            password: None,
+            project_dir: None,
+            binary: None,
+            injection: MemoryInjection::Auto,
+        }
+    }
 }
 
 impl OpenCodeConfig {
@@ -83,6 +118,9 @@ impl OpenCodeConfig {
             password: std::env::var(ENV_SERVER_PASSWORD).ok(),
             project_dir: None,
             binary: std::env::var(ENV_OPENCODE_BIN).ok(),
+            injection: MemoryInjection::from_env_value(
+                std::env::var(ENV_MEMORY_INJECTION).ok().as_deref(),
+            ),
         }
     }
 

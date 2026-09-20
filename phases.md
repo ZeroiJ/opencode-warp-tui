@@ -56,7 +56,9 @@ OpenCode Adapter
 | Memory Research Phase 2A — Memory Model & Minimality Review | ✅ COMPLETE |
 | Memory Research Phase 2B — Storage, Schema & Injection Architecture | ✅ COMPLETE |
 | Phase 5 — Memory Engine Foundation | ✅ COMPLETE |
-| Phase 6 — OpenCode Memory Integration | ⏳ PLANNED |
+| Phase 6A — OpenCode Memory Integration Reconnaissance | ✅ COMPLETE |
+| Phase 6B — OpenCode Memory Integration Implementation | ⏳ PLANNED |
+| Phase 7A — Research & Architecture Reconnaissance | ✅ COMPLETE |
 | Phase 7 — Full Agent Interaction | ⏳ PLANNED |
 | Phase 8 — Memory Intelligence | ⏳ PLANNED |
 | Phase 9 — TUI Memory UX | ⏳ PLANNED |
@@ -302,12 +304,55 @@ security, and the final Adopt/Build/Hybrid decision are resolved:
 * Next phase: Phase 6 (OpenCode Memory Integration) — **start only on
   explicit user authorization**.
 
-### Phase 6 — OpenCode Memory Integration — ⏳ PLANNED
+### Phase 6A — OpenCode Memory Integration Reconnaissance — ✅ COMPLETE
 
-Context Builder + injection gate + capability probe wired into the
-adapter; single `owt.memory` entry at session start, frozen. Gated on
-the Phase 6 precondition: sandboxed verification of instruction-entry
-value rendering (`phase2b-decision-report.md` §8).
+* Objective (research/verification/design only — no implementation): trace
+  OWT session creation, verify the instruction-entry surface live on
+  OpenCode 2.0.8, recheck the 262,144-byte limit, resolve the Phase 2B
+  rendering UNRESOLVED item, and freeze the Phase 6B contract.
+* Verified live: session create → `data.id`; entries PUT/GET/DELETE 204,
+  mutable, session-scoped, key regex 400-enforced; stable alias still 404;
+  200 KiB accepted / 300 KiB → 413 `maxBytes:262144`; no transcript
+  pollution (messages + context empty post-PUT).
+* Rendering resolved by controlled probe (throwaway session, test-only
+  content, deleted after): entry arrives as system-prompt context text —
+  newlines/quotes/JSON/footer intact, no tool calls. One empty-body
+  post-turn entry-GET recorded as watch-only anomaly (V1 never reads back).
+* Outcome: no Phase 2B decision revised (D17 open item completed);
+  Phase 6B contract = consume `ordered_active` + `budget::{select,
+  render_block, encoded_block}`; add 2 thin client wrappers, version-keyed
+  self-cleaning probe, hook in the two create paths (never resume), config
+  knob `memory.injection = auto|off`.
+* Deliverables: `research/memory/phase6a-recon.md`,
+  `research/memory/phase6a-decision-log.md` (6A-R1…R10). No `.rs` touched;
+  `~/warp` untouched; no `6a-` sessions left on the server.
+* Next phase: Phase 6B (implementation) — **start only on explicit user
+  authorization**.
+
+### Phase 6B — OpenCode Memory Integration Implementation — ⏳ PLANNED
+
+Context Builder wiring + injection gate + capability probe in the
+adapter; single `owt.memory` entry at session start, frozen — per the
+Phase 6A contract. **Start only on explicit user authorization.**
+
+### Phase 7A — Research & Architecture Reconnaissance — ✅ COMPLETE
+
+* Research-only: roadmap evidence (phases.md + README agree: Phase 7 =
+  Full Agent Interaction, not memory UI — that is Phase 9), Phase 4
+  leftover reconciliation, read-only adapter/TUI inspection, live 2.0.8
+  OpenAPI surface mapping (113 paths, read-only fetch).
+* Findings: `answer_question` unwired (no `/question/` route on 2.0.8 —
+  delivery mechanism [OPEN] for 7B live verification); permissions/cancel/
+  tools/shell/diffs largely mapped; gaps cluster at gates, history
+  hydration/pagination, reconnect robustness; candidate ops routes
+  (command/compact/diff/model/agent) need item-by-item approval.
+* Frozen: Phase 5/6 untouched; Backend trait additive-only with mock
+  parity; no new deps; Migration: NONE.
+* Deliverables: `research/memory/phase7a-recon.md`,
+  `research/memory/phase7a-decision-log.md` (7A-R1…R5). No `.rs` touched;
+  `~/warp` untouched.
+* Next: Phase 7B implementation — **start only on explicit user
+  authorization** (recommended scope: gates + history/robustness).
 
 ### Phase 7 — Full Agent Interaction — ⏳ PLANNED
 

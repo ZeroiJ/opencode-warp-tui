@@ -200,6 +200,33 @@ pub trait Backend {
     fn submit(&mut self, text: String);
     fn resolve_permission(&mut self, accept: bool);
     fn answer_question(&mut self, option: usize);
+    /// Phase 7C (all additive; every method has MockBackend parity):
+    /// advanced agent operations. Destructive-adjacent ops confirm through
+    /// the existing Question-gate digits (no new TUI seams); failures are
+    /// in-band Errors that never kill the session.
+    /// Admit an async compaction (lifecycle via compaction events/markers).
+    fn compact(&mut self);
+    /// Render the session diff read-only (empty → explicit empty state).
+    fn diff(&mut self);
+    /// Stage a revert boundary (restores files immediately, shows affected
+    /// files, requires digit confirmation before commit).
+    fn stage_revert(&mut self, message_id: String);
+    /// Commit the staged boundary (deletes post-boundary messages,
+    /// irreversible). Errors visibly with no boundary staged.
+    fn commit_revert(&mut self);
+    /// Abandon the staged boundary (messages kept).
+    fn abandon_revert(&mut self);
+    /// Fork the session (full history, or history-before a message).
+    /// Disabled while a turn is running (conservative).
+    fn fork(&mut self, before: Option<String>);
+    /// Switch model/agent after client-side discovery validation; bogus
+    /// ids are rejected locally and never sent (the server 204-accepts
+    /// anything into a dead turn).
+    fn switch_model(&mut self, id: String);
+    fn switch_agent(&mut self, id: String);
+    /// Execute a discovered server slash command (writer commands confirm
+    /// via Question-gate digits; unknown names error visibly, never sent).
+    fn execute_command(&mut self, name: String, text: String);
     /// Append one scripted agent turn (demo control).
     fn simulate_activity(&mut self);
     /// Create a session and return its id.

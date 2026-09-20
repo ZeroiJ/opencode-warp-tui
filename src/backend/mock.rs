@@ -63,6 +63,9 @@ pub struct MockBackend {
     next_id: usize,
     turn: usize,
     streams: HashMap<String, VecDeque<StreamEvent>>,
+    /// Phase 7C parity: staged revert boundary / writer-command confirmation.
+    pending_revert: Option<String>,
+    pending_command: Option<(String, String)>,
 }
 
 impl MockBackend {
@@ -74,6 +77,8 @@ impl MockBackend {
             next_id: 0,
             turn: 0,
             streams: HashMap::new(),
+            pending_revert: None,
+            pending_command: None,
         };
         let id0 = backend.fresh_id();
         let id1 = backend.fresh_id();
@@ -88,6 +93,16 @@ impl MockBackend {
         let id = format!("mock-{}", self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Deterministic Phase 7C catalog (mirrors the opencode validation
+    /// contract: unknown ids error visibly and are never "sent").
+    fn mock_models() -> Vec<&'static str> {
+        vec!["mock-sonnet"]
+    }
+
+    fn mock_agents() -> Vec<&'static str> {
+        vec!["build", "general"]
     }
 
     fn session_mut(&mut self, id: &str) -> Option<&mut Session> {
@@ -287,6 +302,10 @@ impl Backend for MockBackend {
                 description: "Review the working tree diff".into(),
             },
             SlashCommand {
+                name: "init".into(),
+                description: "Guided AGENTS.md setup (writes files)".into(),
+            },
+            SlashCommand {
                 name: "plan".into(),
                 description: "Draft an implementation plan".into(),
             },
@@ -369,6 +388,56 @@ impl Backend for MockBackend {
             });
             return;
         }
+        // Phase 7C slash verbs (mirrors the opencode text routing).
+        if let Some(rest) = trimmed
+            .strip_prefix('/')
+            .filter(|rest| !rest.starts_with('/'))
+        {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let verb = parts.next().unwrap_or("");
+            let args = parts.next().unwrap_or("").trim();
+            let handled = match verb {
+                "diff" => {
+                    self.diff();
+                    true
+                }
+                "compact" => {
+                    self.compact();
+                    true
+                }
+                "fork" => {
+                    self.fork(if args.is_empty() {
+                        None
+                    } else {
+                        Some(args.to_owned())
+                    });
+                    true
+                }
+                "revert" => {
+                    self.stage_revert(args.to_owned());
+                    true
+                }
+                "model" => {
+                    self.switch_model(args.to_owned());
+                    true
+                }
+                "agent" => {
+                    self.switch_agent(args.to_owned());
+                    true
+                }
+                _ => {
+                    if self.commands().iter().any(|command| command.name == verb) {
+                        self.execute_command(verb.to_owned(), args.to_owned());
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if handled {
+                return;
+            }
+        }
         if let Some(letter) = trimmed.strip_prefix("/demo") {
             let scenario = Scenario::from_letter(letter.trim());
             self.push_turn(vec![Block::User { text: trimmed }]);
@@ -419,6 +488,41 @@ impl Backend for MockBackend {
     }
 
     fn answer_question(&mut self, option: usize) {
+        // Phase 7C confirm gates take precedence over the generic gate.
+        if self.pending_revert.is_some() {
+            let commit = option == 0;
+            self.pending_revert = None;
+            self.active_mut().blocks.pop();
+            self.push_turn(vec![Block::Notice {
+                text: if commit {
+                    "Reverted to the selected message.".into()
+                } else {
+                    "Revert abandoned — messages kept.".into()
+                },
+                link: None,
+            }]);
+            return;
+        }
+        if let Some((name, _)) = self.pending_command.clone() {
+            self.pending_command = None;
+            self.active_mut().blocks.pop();
+            if option == 0 {
+                self.push_turn(vec![
+                    Block::User {
+                        text: format!("/{name}"),
+                    },
+                    Block::Assistant {
+                        text: format!("Ran {name}."),
+                    },
+                ]);
+            } else {
+                self.push_turn(vec![Block::Notice {
+                    text: "Command cancelled.".into(),
+                    link: None,
+                }]);
+            }
+            return;
+        }
         let answer = match self.active_mut().blocks.last() {
             Some(Block::Question { q }) => q.options.get(option).cloned(),
             _ => None,
@@ -430,6 +534,180 @@ impl Backend for MockBackend {
         self.push_turn(vec![Block::Assistant {
             text: format!("Using **{answer}** for the rollout."),
         }]);
+    }
+
+    fn compact(&mut self) {
+        self.push_turn(vec![Block::Notice {
+            text: "Compacted session.".into(),
+            link: None,
+        }]);
+    }
+
+    fn diff(&mut self) {
+        self.push_turn(vec![Block::Edits {
+            files: vec![FileDiff {
+                path: "notes.txt".into(),
+                added: 1,
+                removed: 0,
+                lines: vec![(false, "line one".into()), (true, "probe-change-1".into())],
+            }],
+        }]);
+    }
+
+    fn stage_revert(&mut self, message_id: String) {
+        if message_id.trim().is_empty() {
+            self.push_turn(vec![Block::Error {
+                text: "revert: usage `/revert <message-id>`.".into(),
+            }]);
+            return;
+        }
+        self.pending_revert = Some(message_id.clone());
+        self.push_turn(vec![
+            Block::Edits {
+                files: vec![FileDiff {
+                    path: "notes.txt".into(),
+                    added: 0,
+                    removed: 1,
+                    lines: vec![(false, "probe-change-1".into())],
+                }],
+            },
+            Block::Question {
+                q: Question {
+                    prompt: format!(
+                        "Files restored (1). Committing deletes messages after {message_id} — irreversible. Commit?"
+                    ),
+                    options: vec!["Commit".into(), "Keep messages".into()],
+                },
+            },
+        ]);
+    }
+
+    fn commit_revert(&mut self) {
+        if self.pending_revert.is_none() {
+            self.push_turn(vec![Block::Error {
+                text: "revert: no staged boundary.".into(),
+            }]);
+            return;
+        }
+        self.pending_revert = None;
+        if matches!(
+            self.active_mut().blocks.last(),
+            Some(Block::Question { .. })
+        ) {
+            self.active_mut().blocks.pop();
+        }
+        self.push_turn(vec![Block::Notice {
+            text: "Reverted to the selected message.".into(),
+            link: None,
+        }]);
+    }
+
+    fn abandon_revert(&mut self) {
+        if self.pending_revert.is_none() {
+            self.push_turn(vec![Block::Error {
+                text: "revert: no staged boundary.".into(),
+            }]);
+            return;
+        }
+        self.pending_revert = None;
+        if matches!(
+            self.active_mut().blocks.last(),
+            Some(Block::Question { .. })
+        ) {
+            self.active_mut().blocks.pop();
+        }
+        self.push_turn(vec![Block::Notice {
+            text: "Revert abandoned — messages kept.".into(),
+            link: None,
+        }]);
+    }
+
+    fn fork(&mut self, before: Option<String>) {
+        if let Some(before) = &before {
+            if before != "msg_1" {
+                self.push_turn(vec![Block::Error {
+                    text: format!("fork: unknown message {before}."),
+                }]);
+                return;
+            }
+        }
+        let parent = self.active_id();
+        let id = self.fresh_id();
+        let blocks = self
+            .session_mut(&parent)
+            .map(|session| session.blocks.clone())
+            .unwrap_or_default();
+        self.sessions.push(Session {
+            id: id.clone(),
+            title: format!("{} (fork #1)", self.sessions[self.active].title),
+            blocks,
+        });
+        // Parent preserved, active unchanged; the child hydrates lazily.
+        self.push_turn(vec![Block::Notice {
+            text: format!("Forked to {id}."),
+            link: None,
+        }]);
+    }
+
+    fn switch_model(&mut self, id: String) {
+        if !Self::mock_models().contains(&id.as_str()) {
+            self.push_turn(vec![Block::Error {
+                text: format!("Unknown model: {id}. Available: mock-sonnet"),
+            }]);
+            return;
+        }
+        self.push_turn(vec![Block::Notice {
+            text: format!("Model switched to {id}."),
+            link: None,
+        }]);
+    }
+
+    fn switch_agent(&mut self, id: String) {
+        if !Self::mock_agents().contains(&id.as_str()) {
+            self.push_turn(vec![Block::Error {
+                text: format!("Unknown agent: {id}. Available: build, general"),
+            }]);
+            return;
+        }
+        self.push_turn(vec![Block::Notice {
+            text: format!("Agent switched to {id}."),
+            link: None,
+        }]);
+    }
+
+    fn execute_command(&mut self, name: String, text: String) {
+        let known = self.commands().iter().any(|command| command.name == name);
+        if !known {
+            self.push_turn(vec![Block::Error {
+                text: format!("Unknown command: {name}."),
+            }]);
+            return;
+        }
+        if name == "init" && self.pending_command.is_none() {
+            self.pending_command = Some((name.clone(), text));
+            self.push_turn(vec![Block::Question {
+                q: Question {
+                    prompt: "The `init` command writes workspace files. Run it?".into(),
+                    options: vec!["Run".into(), "Cancel".into()],
+                },
+            }]);
+            return;
+        }
+        self.pending_command = None;
+        let line = format!(
+            "/{name}{}",
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!(" {text}")
+            }
+        );
+        self.push_turn(vec![
+            Block::User { text: line },
+            Block::Assistant {
+                text: format!("Ran {name}."),
+            },
+        ]);
     }
 
     fn simulate_activity(&mut self) {
@@ -803,5 +1081,138 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].output.len(), 3);
         assert_eq!(runs[0].state, ToolState::Done);
+    }
+
+    #[test]
+    fn compact_and_diff_push_blocks() {
+        let mut backend = MockBackend::demo();
+        backend.compact();
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { .. })
+        ));
+        backend.diff();
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Edits { .. })
+        ));
+    }
+
+    #[test]
+    fn revert_stage_confirm_commit() {
+        let mut backend = MockBackend::demo();
+        backend.stage_revert("msg_1".into());
+        assert_eq!(backend.blocker(), Some(Blocker::Question));
+        backend.answer_question(0);
+        assert_eq!(backend.blocker(), None);
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { text, .. }) if text.contains("Reverted")
+        ));
+    }
+
+    #[test]
+    fn revert_stage_reject_abandons() {
+        let mut backend = MockBackend::demo();
+        backend.stage_revert("msg_1".into());
+        backend.answer_question(1);
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { text, .. }) if text.contains("abandoned")
+        ));
+        // No boundary left: committing now errors visibly.
+        backend.commit_revert();
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Error { .. })
+        ));
+    }
+
+    #[test]
+    fn fork_registers_child_and_keeps_parent() {
+        let mut backend = MockBackend::demo();
+        let before = backend.session_summaries().len();
+        let parent = active_id(&backend);
+        backend.fork(None);
+        assert_eq!(backend.session_summaries().len(), before + 1);
+        assert_eq!(active_id(&backend), parent);
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { text, .. }) if text.contains("Forked")
+        ));
+        backend.fork(Some("msg_bogus".into()));
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Error { .. })
+        ));
+    }
+
+    #[test]
+    fn switch_validation_rejects_unknown() {
+        let mut backend = MockBackend::demo();
+        backend.switch_model("bogus".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Error { text }) if text.contains("bogus")
+        ));
+        backend.switch_model("mock-sonnet".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { text, .. }) if text.contains("mock-sonnet")
+        ));
+        backend.switch_agent("bogus".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Error { .. })
+        ));
+        backend.switch_agent("general".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { text, .. }) if text.contains("general")
+        ));
+    }
+
+    #[test]
+    fn commands_unknown_gates_writer() {
+        let mut backend = MockBackend::demo();
+        backend.execute_command("nope".into(), String::new());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Error { text }) if text.contains("Unknown command")
+        ));
+        // Writer command gates; cancel leaves no POST behind.
+        backend.execute_command("init".into(), String::new());
+        assert_eq!(backend.blocker(), Some(Blocker::Question));
+        backend.answer_question(1);
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Notice { text, .. }) if text.contains("cancelled")
+        ));
+        // Read-only command runs immediately.
+        backend.execute_command("review".into(), String::new());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Assistant { text }) if text.contains("Ran review")
+        ));
+    }
+
+    #[test]
+    fn slash_verbs_route_to_ops() {
+        let mut backend = MockBackend::demo();
+        backend.submit("/diff".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Edits { .. })
+        ));
+        backend.submit("/model bogus".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Error { .. })
+        ));
+        // Unknown /words keep the historical prompt-turn behavior.
+        let before = active_blocks(&backend).len();
+        backend.submit("/tmp path".into());
+        drain(&mut backend);
+        assert!(active_blocks(&backend).len() > before);
     }
 }

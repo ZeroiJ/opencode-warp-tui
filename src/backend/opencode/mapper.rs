@@ -414,8 +414,36 @@ pub fn map_event(typ: &str, data: &Value, draft: &mut DraftState) -> Vec<StreamE
         "permission.v2.replied" => vec![],
         "question.v2.asked" => map_question(data),
         "question.v2.replied" | "question.v2.rejected" => vec![],
-        // prompt/inbox/instructions/usage/context/compaction/revert/synthetic
-        // and agent/model switches carry no transcript content in Phase 4.
+        // Live 2.0.8 materializes the `question` tool as a form
+        // (metadata.kind == "question"); `question.v2.asked` never fires.
+        "form.created" => map_form_created(data),
+        "form.replied" | "form.rejected" => vec![],
+        // prompt/inbox/instructions/usage/context/synthetic events carry no
+        // transcript content. Compaction/revert/switch events map below.
+        "compaction.started" => vec![StreamEvent::WorkLabel("Compacting…".into())],
+        "compaction.failed" => {
+            let message = data
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Compaction failed.")
+                .to_owned();
+            vec![
+                StreamEvent::WorkLabel(String::new()),
+                StreamEvent::Push(Block::Error { text: message }),
+            ]
+        }
+        "compaction.ended" => vec![
+            StreamEvent::WorkLabel(String::new()),
+            StreamEvent::Push(Block::Notice {
+                text: "Compacted session.".into(),
+                link: None,
+            }),
+        ],
+        "revert.committed" => vec![StreamEvent::Push(Block::Notice {
+            text: "Reverted to the selected message.".into(),
+            link: None,
+        })],
         _ => vec![],
     }
 }
@@ -500,6 +528,58 @@ fn map_question(data: &Value) -> Vec<StreamEvent> {
     events
 }
 
+/// Map a `form.created` envelope whose `metadata.kind` is "question" into
+/// one `Block::Question` per question field. Other kinds (parameter forms,
+/// tool metadata) map to nothing. Shape captured live on 2.0.8: the
+/// envelope data carries `{form: {id, metadata, fields}}`.
+fn map_form_created(data: &Value) -> Vec<StreamEvent> {
+    let form = data.get("form");
+    let Some(form) = form else {
+        return vec![];
+    };
+    let kind = form
+        .get("metadata")
+        .and_then(|metadata| metadata.get("kind"))
+        .and_then(Value::as_str);
+    if kind != Some("question") {
+        return vec![];
+    }
+    let fields = form.get("fields").and_then(Value::as_array);
+    let Some(fields) = fields else {
+        return vec![];
+    };
+    let mut events = Vec::new();
+    for field in fields {
+        let title = field.get("title").and_then(Value::as_str).unwrap_or("");
+        let description = field
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let prompt = if title.is_empty() {
+            description.to_owned()
+        } else if description.is_empty() {
+            title.to_owned()
+        } else {
+            format!("{title}: {description}")
+        };
+        let options = field
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| option.get("label").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        events.push(StreamEvent::Push(Block::Question {
+            q: Question { prompt, options },
+        }));
+    }
+    events
+}
+
 /// Map one REST/history message object to transcript blocks. Handles both the
 /// V2 `content[]` shape and V1-export `parts[]` shape.
 pub fn map_message(message: &Value) -> Vec<Block> {
@@ -545,6 +625,44 @@ pub fn map_message(message: &Value) -> Vec<Block> {
                     state,
                 },
             }]
+        }
+        // Phase 7C: switches/compactions materialize as history messages
+        // (probed live on 2.0.8) — they must not hydrate as holes.
+        "agent-switched" => vec![Block::Notice {
+            text: format!(
+                "Agent switched to {}.",
+                message.get("agent").and_then(Value::as_str).unwrap_or("?")
+            ),
+            link: None,
+        }],
+        "model-switched" => vec![Block::Notice {
+            text: format!(
+                "Model switched to {}.",
+                message
+                    .get("model")
+                    .and_then(|model| model.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            ),
+            link: None,
+        }],
+        "compaction" => {
+            let status = message.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "failed" {
+                vec![Block::Error {
+                    text: message
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Compaction failed.")
+                        .to_owned(),
+                }]
+            } else {
+                vec![Block::Notice {
+                    text: "Compacted session.".into(),
+                    link: None,
+                }]
+            }
         }
         _ => vec![],
     }
@@ -817,6 +935,118 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn question_v2_gate_and_form_created_share_router() {
+        // `question.v2.asked` (older servers) and `form.created` with
+        // `metadata.kind == "question"` (live 2.0.8) both render one
+        // `Block::Question` per question. Live shape captured in
+        // research/memory/phase7b-question-probe.md.
+        let mut draft = DraftState::default();
+        let events = map_event(
+            "form.created",
+            &json!({"form": {
+                "id": "frm_1",
+                "sessionID": "ses_1",
+                "title": "One more thing",
+                "metadata": {"kind": "question"},
+                "fields": [
+                    {"key": "q0", "title": "Pick a lane", "description": "Which?",
+                     "type": "select", "custom": true, "options": [
+                        {"value": "fast", "label": "Fast"},
+                        {"value": "slow", "label": "Slow"},
+                    ]}
+                ]
+            }}),
+            &mut draft,
+        );
+        match events.as_slice() {
+            [StreamEvent::Push(Block::Question { q })] => {
+                assert_eq!(q.prompt, "Pick a lane: Which?");
+                assert_eq!(q.options, vec!["Fast".to_owned(), "Slow".to_owned()]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_question_forms_map_to_nothing() {
+        let mut draft = DraftState::default();
+        let events = map_event(
+            "form.created",
+            &json!({"form": {
+                "id": "frm_2",
+                "sessionID": "ses_1",
+                "metadata": {"kind": "task"},
+                "fields": [{"key": "p0", "title": "Param", "type": "input"}]
+            }}),
+            &mut draft,
+        );
+        assert!(events.is_empty());
+        // Missing envelope entirely: no panic, nothing mapped.
+        assert!(map_event("form.created", &json!({}), &mut draft).is_empty());
+    }
+
+    #[test]
+    fn switch_markers_map_to_notices() {
+        // Shapes probed live on 2.0.8 (throwaway session, deleted):
+        // agent-switched carries {"agent"}, model-switched {"model":{...}}.
+        let blocks = map_message(&json!({"type": "agent-switched", "agent": "general"}));
+        match blocks.as_slice() {
+            [Block::Notice { text, .. }] => assert!(text.contains("general"), "got: {text}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let blocks = map_message(
+            &json!({"type": "model-switched", "model": {"id": "m", "providerID": "p"}}),
+        );
+        match blocks.as_slice() {
+            [Block::Notice { text, .. }] => assert!(text.contains('m'), "got: {text}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Bare markers still render (never a transcript hole).
+        assert!(!map_message(&json!({"type": "agent-switched"})).is_empty());
+        assert!(!map_message(&json!({"type": "model-switched"})).is_empty());
+    }
+
+    #[test]
+    fn compaction_history_maps_typed_failure() {
+        let blocks = map_message(&json!({"type": "compaction", "status": "failed",
+                "error": {"type": "compaction.unavailable", "message": "Nothing to compact yet"}}));
+        match blocks.as_slice() {
+            [Block::Error { text }] => {
+                assert!(text.contains("Nothing to compact yet"), "got: {text}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Non-failed compaction renders a notice, never nothing.
+        let blocks = map_message(&json!({"type": "compaction", "status": "completed"}));
+        assert!(matches!(blocks.as_slice(), [Block::Notice { .. }]));
+    }
+
+    #[test]
+    fn compaction_and_revert_events_map() {
+        let mut draft = DraftState::default();
+        let started = map_event(
+            "session.compaction.started",
+            &json!({"reason": "manual"}),
+            &mut draft,
+        );
+        assert!(
+            matches!(started.as_slice(), [StreamEvent::WorkLabel(label)] if label == "Compacting…")
+        );
+        let failed = map_event(
+            "session.compaction.failed",
+            &json!({"reason": "manual", "error": {"type": "compaction.unavailable", "message": "Nothing to compact yet"}}),
+            &mut draft,
+        );
+        assert!(failed
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Push(Block::Error { .. }))));
+        let committed = map_event("session.revert.committed", &json!({}), &mut draft);
+        assert!(committed
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Push(Block::Notice { .. }))));
     }
 
     #[test]

@@ -87,12 +87,26 @@ impl SseWorker {
             .name("owt-opencode-sse".into())
             .spawn(move || {
                 let mut backoff = Duration::from_secs(1);
+                // Track the live feed: emit a synthetic `connection.lost` when
+                // the stream ends (EOF/error) and `connection.restored` once a
+                // reconnect succeeds. The adapter reconciles stale busy flags
+                // and surfaces the gap in-band (see `mod.rs` ingest).
+                let mut lost_announced = false;
                 while !flag.load(Ordering::Relaxed) {
                     let Some(reader) = open() else {
+                        // Reconnect attempt not yet accepted: just back off.
+                        // (A loss is only announced when the stream ends, so
+                        // this path never double-announces.)
                         std::thread::sleep(backoff);
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                         continue;
                     };
+                    if lost_announced {
+                        if send_connection_event(&sender, "connection.restored") {
+                            return;
+                        }
+                        lost_announced = false;
+                    }
                     backoff = Duration::from_secs(1);
                     // Buffer data lines and flush whole payloads through the
                     // shared batch parser (single code path with its tests).
@@ -123,7 +137,14 @@ impl SseWorker {
                     if stopped {
                         return;
                     }
-                    // Stream ended (server hiccup or disconnect): reconnect.
+                    // Stream ended (server hiccup or disconnect): announce the
+                    // drop once, then reconnect with backoff.
+                    if !lost_announced {
+                        if send_connection_event(&sender, "connection.lost") {
+                            return;
+                        }
+                        lost_announced = true;
+                    }
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
@@ -131,6 +152,16 @@ impl SseWorker {
             .ok();
         Self { handle, shutdown }
     }
+}
+
+/// Send a synthetic connection-lifecycle event (no session attribution).
+/// Returns `true` when the consumer is gone and the worker should stop.
+fn send_connection_event(sender: &std::sync::mpsc::Sender<RawEvent>, typ: &str) -> bool {
+    let event = RawEvent {
+        typ: typ.to_owned(),
+        data: Value::Null,
+    };
+    sender.send(event).is_err()
 }
 
 impl Drop for SseWorker {
