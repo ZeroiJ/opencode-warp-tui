@@ -210,6 +210,14 @@ impl JsonlStore {
         &self.dir
     }
 
+    /// Tombstone pre-check for Phase 8 (8-R1): does this scope's tombstone
+    /// file cover the canonical identity (kind + scope + normalized
+    /// content)? Missing file = no hit. Read-only; never writes.
+    pub fn tombstone_contains(&self, kind: Kind, content: &str) -> Result<bool, MemoryError> {
+        let hashes = tombstone::load_hashes(&self.dir.join("tombstones.jsonl"))?;
+        Ok(tombstone::contains(&hashes, kind, self.scope, content))
+    }
+
     /// Exclusive in-process + cross-process mutation runner:
     /// lock → re-read under the lock → `action` builds the next state →
     /// atomic rewrite. `action` may also append tombstones (forget does,
@@ -716,6 +724,7 @@ mod tests {
             session_id: "ses_test".to_owned(),
             source_ref: None,
             quote: None,
+            method: None,
         }
     }
 

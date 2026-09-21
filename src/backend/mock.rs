@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use super::{
+    memory::{command, triage, MemoryApi},
     AgentStatus, Backend, Block, Blocker, FileDiff, PermissionRequest, Question, Session,
     SessionSummary, ShellRun, SlashCommand, StatusInfo, StreamEvent, ToolCall, ToolState,
 };
@@ -66,11 +67,22 @@ pub struct MockBackend {
     /// Phase 7C parity: staged revert boundary / writer-command confirmation.
     pending_revert: Option<String>,
     pending_command: Option<(String, String)>,
+    /// Phase 8 parity: a real memory engine + proposal queues in temp
+    /// dirs, so `/memory suggest|confirm|discard` run the same triage
+    /// code as the OpenCode adapter (dev/test only — nothing persists
+    /// beyond the process).
+    memory: MemoryApi,
 }
 
 impl MockBackend {
     /// Three scripted sessions covering conversation, shell, and gates.
     pub fn demo() -> Self {
+        // Unique temp dir per instance: parallel tests must never share
+        // quarantine queue files (the queue has no cross-process lock —
+        // production use is single-threaded adapter code).
+        static DEMO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = DEMO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("owt-mock-{}-{seq}", std::process::id()));
         let mut backend = Self {
             sessions: Vec::new(),
             active: 0,
@@ -79,6 +91,7 @@ impl MockBackend {
             streams: HashMap::new(),
             pending_revert: None,
             pending_command: None,
+            memory: MemoryApi::open(dir, None),
         };
         let id0 = backend.fresh_id();
         let id1 = backend.fresh_id();
@@ -103,6 +116,72 @@ impl MockBackend {
 
     fn mock_agents() -> Vec<&'static str> {
         vec!["build", "general"]
+    }
+
+    /// Phase 8 parity: generate rule proposals from this session's user
+    /// blocks into the temp quarantine queues. Silent, best-effort.
+    fn refresh_proposals(&mut self, session_id: &str) {
+        let texts: Vec<String> = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| {
+                session
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::User { text } => {
+                            let trimmed = text.trim();
+                            if trimmed.is_empty()
+                                || trimmed == "/memory"
+                                || trimmed == "/mem"
+                                || trimmed.starts_with("/memory ")
+                                || trimmed.starts_with("/mem ")
+                            {
+                                None
+                            } else {
+                                Some(trimmed.to_owned())
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if texts.is_empty() {
+            return;
+        }
+        if triage::refresh_session_proposals(&self.memory, session_id, &texts, false).is_err() {
+            // Best-effort only; the session is never affected.
+        }
+    }
+
+    /// Phase 8 parity: answer a classified `/memory` triage verb in-band.
+    fn memory_triage(&mut self, text: &str) -> Option<Block> {
+        let parsed = match command::parse(command::prefix_remainder(text)) {
+            Ok(command::Command::Suggest) => {
+                self.refresh_proposals(&self.active_id());
+                triage::suggest_text(&mut self.memory).map(|text| Block::Assistant { text })
+            }
+            Ok(command::Command::Confirm {
+                target,
+                scope,
+                kind,
+            }) => triage::confirm_proposal(&mut self.memory, &target, scope, kind)
+                .map(|text| Block::Assistant { text }),
+            Ok(command::Command::Discard {
+                target,
+                confirm_all,
+            }) => triage::discard_proposal(&mut self.memory, target.as_ref(), confirm_all)
+                .map(|text| Block::Assistant { text }),
+            _ => return None,
+        };
+        Some(match parsed {
+            Ok(block) => block,
+            Err(error) => Block::Error {
+                text: format!("memory: {error}"),
+            },
+        })
     }
 
     fn session_mut(&mut self, id: &str) -> Option<&mut Session> {
@@ -275,7 +354,12 @@ impl Backend for MockBackend {
 
     fn set_active(&mut self, index: usize) {
         if index < self.sessions.len() {
+            let leaving = self.sessions[self.active].id.clone();
             self.active = index;
+            // Phase 8 parity: leaving a session ends it for extraction.
+            if self.sessions[self.active].id != leaving {
+                self.refresh_proposals(&leaving);
+            }
         }
     }
 
@@ -387,6 +471,14 @@ impl Backend for MockBackend {
                 text: "Fresh session — ask anything.".into(),
             });
             return;
+        }
+        // Phase 8 parity: triage verbs run the shared engine; every other
+        // /memory verb keeps the historical canned-turn behavior.
+        if matches!(command::classify(&trimmed), command::Classified::Command) {
+            if let Some(reply) = self.memory_triage(&trimmed) {
+                self.push_turn(vec![Block::User { text: trimmed }, reply]);
+                return;
+            }
         }
         // Phase 7C slash verbs (mirrors the opencode text routing).
         if let Some(rest) = trimmed
@@ -1214,5 +1306,53 @@ mod tests {
         backend.submit("/tmp path".into());
         drain(&mut backend);
         assert!(active_blocks(&backend).len() > before);
+    }
+
+    #[test]
+    fn memory_triage_suggest_confirm_flow() {
+        let mut backend = MockBackend::demo();
+        // A user statement enters through the normal submit path, then
+        // suggest refreshes from this session's user blocks.
+        backend.submit("Always file triage paperwork first.".into());
+        drain(&mut backend);
+        backend.submit("/memory suggest".into());
+        let last = active_blocks(&backend).last().cloned();
+        match last {
+            Some(Block::Assistant { text }) => {
+                assert!(text.contains("quarantined"), "got: {text}");
+                assert!(text.contains("Always file triage paperwork first."));
+            }
+            other => panic!("expected suggest reply, got {other:?}"),
+        }
+        backend.submit("/memory confirm 1".into());
+        match active_blocks(&backend).last() {
+            Some(Block::Assistant { text }) => assert!(text.contains("confirmed"), "got: {text}"),
+            other => panic!("expected confirm reply, got {other:?}"),
+        }
+        // Queue drained; a second suggest finds nothing pending.
+        backend.submit("/memory suggest".into());
+        match active_blocks(&backend).last() {
+            Some(Block::Assistant { text }) => {
+                assert!(text.contains("no pending proposals"), "got: {text}")
+            }
+            other => panic!("expected empty suggest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_triage_discard_flow() {
+        let mut backend = MockBackend::demo();
+        backend.submit("Never skip the changelog entry.".into());
+        drain(&mut backend);
+        backend.submit("/memory suggest".into());
+        assert!(matches!(
+            active_blocks(&backend).last(),
+            Some(Block::Assistant { .. })
+        ));
+        backend.submit("/memory discard 1".into());
+        match active_blocks(&backend).last() {
+            Some(Block::Assistant { text }) => assert!(text.contains("discarded"), "got: {text}"),
+            other => panic!("expected discard reply, got {other:?}"),
+        }
     }
 }

@@ -32,11 +32,23 @@ pub mod api;
 #[allow(dead_code)]
 pub mod budget;
 pub mod command;
+/// Phase 8 rule-based proposal generator (deterministic, user-messages
+/// only — 8-R1–R3). Pure history → drafts; quarantine lives in
+/// `proposal`.
+pub mod extract;
 pub mod key;
+/// Phase 8 deterministic lexical scorer (ordering only — 8-R7).
+/// Dormant until query terms exist; empty terms reproduce base order.
+pub mod lexical;
+/// Phase 8 proposal quarantine queue (persistent, atomic, bounded).
+pub mod proposal;
 pub mod record;
 pub mod secret;
 pub mod store;
 pub mod tombstone;
+/// Phase 8 triage orchestration over `MemoryApi` (suggest/confirm/
+/// discard + session-end refresh). Shared by both backends.
+pub mod triage;
 
 pub use api::MemoryApi;
 

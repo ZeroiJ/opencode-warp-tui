@@ -33,6 +33,13 @@ pub struct NewMemoryArgs {
     pub content: String,
     pub pinned: bool,
     pub scope: ScopeTarget,
+    /// How the record entered (Phase 8, 8-R9). `None` = explicit.
+    pub method: Option<crate::backend::memory::record::Method>,
+    /// Evidence quote (Phase 8 confirm path preserves proposal provenance).
+    pub quote: Option<String>,
+    /// Originating session override (Phase 8 confirm path preserves the
+    /// proposing session, not the confirming one). `None` = caller session.
+    pub session_id: Option<String>,
 }
 
 /// A successful write plus any secretary warning to surface in-band.
@@ -186,9 +193,13 @@ impl MemoryApi {
             kind: args.kind,
             content: args.content.clone(),
             pinned: args.pinned,
-            session_id: session_id.trim().to_owned(),
+            session_id: args
+                .session_id
+                .clone()
+                .unwrap_or_else(|| session_id.trim().to_owned()),
             source_ref: None,
-            quote: None,
+            quote: args.quote.clone(),
+            method: args.method.clone(),
         };
         let outcome = store.remember(new)?;
         Ok(WriteResult { outcome, warning })
@@ -213,9 +224,13 @@ impl MemoryApi {
             kind: args.kind,
             content: args.content.clone(),
             pinned: args.pinned,
-            session_id: session_id.trim().to_owned(),
+            session_id: args
+                .session_id
+                .clone()
+                .unwrap_or_else(|| session_id.trim().to_owned()),
             source_ref: None,
-            quote: None,
+            quote: args.quote.clone(),
+            method: args.method.clone(),
         };
         let outcome = store.update(&key, new)?;
         Ok(WriteResult { outcome, warning })
@@ -303,6 +318,80 @@ impl MemoryApi {
         order_active(&mut records);
         Ok(records)
     }
+
+    /// Whole-corpus ACTIVE reads in one scope (Phase 8 proposal dedup input).
+    pub fn active_in(&self, scope: Scope) -> Result<Vec<MemoryRecord>, MemoryError> {
+        self.guard()?;
+        match scope {
+            Scope::User => self.user()?.active(&StoreFilter::default()),
+            Scope::Project => self.project()?.active(&StoreFilter::default()),
+        }
+    }
+
+    /// Whether a project store exists (Phase 8 scope guard: project-scope
+    /// proposals and confirms require a project root).
+    pub fn has_project(&self) -> bool {
+        self.project.is_some()
+    }
+
+    /// Tombstone pre-check for Phase 8 (8-R1): has this canonical identity
+    /// (kind + scope + normalized content) been forgotten? Reads the
+    /// scope's tombstone file; missing file = no hit. Never writes.
+    pub fn tombstone_hit(
+        &self,
+        kind: Kind,
+        scope: Scope,
+        content: &str,
+    ) -> Result<bool, MemoryError> {
+        self.guard()?;
+        let store = match scope {
+            Scope::User => self.user()?,
+            Scope::Project => self.project()?,
+        };
+        store.tombstone_contains(kind, content)
+    }
+
+    /// ACTIVE corpus in D24 order, refined by the Phase 8 lexical scorer
+    /// (8-R7): stable score-descending pass over the D24 order. With empty
+    /// terms every score is zero and the output is byte-identical to
+    /// `ordered_active` (dormant by construction — tested). Dormant until
+    /// a query-aware caller exists (retrieval-design §4); the scorer's
+    /// live use today is confirm-context ordering in triage.
+    #[allow(dead_code)]
+    pub fn ordered_active_scored(
+        &self,
+        terms: &[String],
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        let mut records = self.ordered_active()?;
+        super::lexical::order_records(&mut records, terms);
+        Ok(records)
+    }
+
+    /// Open the proposal quarantine queue for a scope (Phase 8, 8-R1).
+    /// Fresh on every access (load + lazy expiry); callers save after
+    /// mutating. Fails controlled when memory is disabled or the scope
+    /// has no store.
+    pub fn proposal_queue(
+        &self,
+        scope: Scope,
+    ) -> Result<super::proposal::ProposalQueue, MemoryError> {
+        self.guard()?;
+        let dir = match scope {
+            Scope::User => self
+                .user
+                .as_ref()
+                .map(|store| store.store_dir().to_path_buf())
+                .expect("user store present when enabled"),
+            Scope::Project => self
+                .project
+                .as_ref()
+                .map(|store| store.store_dir().to_path_buf())
+                .ok_or_else(|| {
+                    MemoryError::InvalidScope("no project scope (no project root)".into())
+                })?,
+        };
+        super::proposal::ProposalQueue::open(dir, scope)
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +413,9 @@ mod tests {
             content: content.to_owned(),
             pinned: false,
             scope: ScopeTarget::Default,
+            method: None,
+            quote: None,
+            session_id: None,
         }
     }
 
@@ -513,5 +605,41 @@ mod tests {
         assert_eq!(ordered.len(), 2);
         assert_eq!(ordered[0].scope, Scope::Project);
         assert!(ordered[0].pinned);
+    }
+
+    #[test]
+    fn remember_stores_method_quote_and_origin_session() {
+        use crate::backend::memory::record::Method;
+        let mut api = api_with("method", false);
+        let mut with_method = args("Always write tests first.");
+        with_method.key = None;
+        with_method.method = Some(Method::Rule("imperative-v1".to_owned()));
+        with_method.quote = Some("Always write tests first.".to_owned());
+        with_method.session_id = Some("ses_origin".to_owned());
+        let result = api.remember("ses_confirm", &with_method).unwrap();
+        assert_eq!(
+            result.outcome.created.method,
+            Some(Method::Rule("imperative-v1".to_owned()))
+        );
+        assert_eq!(result.outcome.created.session_id, "ses_origin");
+        assert_eq!(
+            result.outcome.created.quote.as_deref(),
+            Some("Always write tests first.")
+        );
+    }
+
+    #[test]
+    fn ordered_active_scored_empty_terms_is_byte_identical() {
+        let mut api = api_with("scored", true);
+        api.remember("ses_1", &args("rust compiler flags")).unwrap();
+        let mut flagged = args("weather note");
+        flagged.key = Some("w".to_owned());
+        api.remember("ses_1", &flagged).unwrap();
+        let plain = api.ordered_active().unwrap();
+        let scored = api.ordered_active_scored(&[]).unwrap();
+        assert_eq!(plain, scored);
+        // With terms, relevance reorders (compiler row first).
+        let ranked = api.ordered_active_scored(&["compiler".to_owned()]).unwrap();
+        assert!(ranked[0].content.contains("compiler"));
     }
 }

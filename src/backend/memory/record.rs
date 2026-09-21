@@ -123,6 +123,40 @@ impl Status {
     }
 }
 
+/// How a record entered the store (Phase 8, 8-R9). Optional; absent
+/// reads as `explicit` (all pre-8 rows). `explicit` = user-stated via
+/// remember/update; `rule:<name>` = rule-proposed, user-confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Method {
+    Explicit,
+    Rule(String),
+}
+
+impl Method {
+    pub fn as_str(&self) -> String {
+        match self {
+            Method::Explicit => "explicit".to_owned(),
+            Method::Rule(name) => format!("rule:{name}"),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Method> {
+        if value == "explicit" {
+            return Some(Method::Explicit);
+        }
+        if let Some(name) = value.strip_prefix("rule:") {
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+            {
+                return Some(Method::Rule(name.to_owned()));
+            }
+        }
+        None
+    }
+}
+
 /// A complete `v:1` memory record (D16).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryRecord {
@@ -144,6 +178,9 @@ pub struct MemoryRecord {
     pub source_ref: Option<String>,
     /// Optional evidence quote (≤256 chars); never fabricated.
     pub quote: Option<String>,
+    /// How the record entered (Phase 8, 8-R9). `None` on write means
+    /// `explicit`; absent on load reads as `explicit`.
+    pub method: Option<Method>,
 }
 
 impl MemoryRecord {
@@ -164,6 +201,7 @@ impl MemoryRecord {
             session_id: new.session_id.clone(),
             source_ref: new.source_ref.clone(),
             quote: new.quote.clone(),
+            method: new.method.clone(),
         }
     }
 
@@ -201,6 +239,11 @@ impl MemoryRecord {
                 .as_ref()
                 .map_or(Value::Null, |q| Value::from(q.clone())),
         );
+        // Phase 8 (8-R9): emitted only when present, so pre-8 files stay
+        // byte-identical until a method-carrying row is written.
+        if let Some(method) = &self.method {
+            object.insert("method".into(), Value::from(method.as_str()));
+        }
         serde_json::to_string(&Value::Object(object)).expect("record serializes to JSON")
     }
 }
@@ -217,6 +260,8 @@ pub struct NewMemory {
     pub session_id: String,
     pub source_ref: Option<String>,
     pub quote: Option<String>,
+    /// How the record entered (Phase 8, 8-R9). `None` = explicit.
+    pub method: Option<Method>,
 }
 
 impl NewMemory {
@@ -266,6 +311,17 @@ impl NewMemory {
                 return Err(MemoryError::InvalidMemory(
                     "source_ref must be control-free (≤256 chars)".into(),
                 ));
+            }
+        }
+        if let Some(method) = &self.method {
+            match method {
+                Method::Explicit => {}
+                Method::Rule(name) if !name.is_empty() => {}
+                _ => {
+                    return Err(MemoryError::InvalidMemory(
+                        "method must be explicit or rule:<name>".into(),
+                    ));
+                }
             }
         }
         Ok(NewMemory {
@@ -429,6 +485,17 @@ pub fn record_from_line(line: &str, file_scope: Scope) -> Result<MemoryRecord, S
         }
     }
 
+    // Phase 8 (8-R9): optional, absent reads as explicit. A present
+    // non-string or malformed value is corrupt (same discipline as enums).
+    let method = match object.get("method") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(
+            Method::parse(value)
+                .ok_or_else(|| "bad method (want explicit or rule:<name>)".to_owned())?,
+        ),
+        _ => return Err("method is not a string".to_owned()),
+    };
+
     Ok(MemoryRecord {
         id,
         key,
@@ -443,6 +510,7 @@ pub fn record_from_line(line: &str, file_scope: Scope) -> Result<MemoryRecord, S
         session_id,
         source_ref,
         quote,
+        method,
     })
 }
 
@@ -658,6 +726,7 @@ mod tests {
             session_id: "ses_test".to_owned(),
             source_ref: None,
             quote: None,
+            method: None,
         }
     }
 
@@ -886,6 +955,7 @@ mod tests {
                 session_id: "ses".to_owned(),
                 source_ref: None,
                 quote: None,
+                method: None,
             };
         let mut records = vec![
             make(
@@ -956,6 +1026,7 @@ mod tests {
             session_id: "ses".to_owned(),
             source_ref: None,
             quote: None,
+            method: None,
         };
         let mut records = vec![
             make("owt_1_2_b", "2026-01-01T00:00:00Z"),
@@ -983,6 +1054,7 @@ mod tests {
             session_id: "ses".to_owned(),
             source_ref: None,
             quote: None,
+            method: None,
         };
         let mut records = vec![make("owt_1_1_12"), make("owt_1_1_5"), make("owt_1_2_5")];
         order_active(&mut records);
@@ -1010,5 +1082,57 @@ mod tests {
         assert!(has_control_chars("a\nb"));
         assert!(!has_control_chars("a b"));
         assert!(!has_control_chars("a\u{7F}b")); // DEL is not C0.
+    }
+
+    #[test]
+    fn method_parses_explicit_and_rules() {
+        assert_eq!(Method::parse("explicit"), Some(Method::Explicit));
+        assert_eq!(
+            Method::parse("rule:imperative-v1"),
+            Some(Method::Rule("imperative-v1".to_owned()))
+        );
+        assert_eq!(Method::parse(""), None);
+        assert_eq!(Method::parse("rule:"), None);
+        assert_eq!(Method::parse("confidence"), None);
+        assert_eq!(Method::parse("RULE:x"), None);
+        assert_eq!(Method::Explicit.as_str(), "explicit".to_owned());
+        assert_eq!(
+            Method::Rule("constraint-v1".to_owned()).as_str(),
+            "rule:constraint-v1".to_owned()
+        );
+    }
+
+    #[test]
+    fn method_round_trips_and_absent_reads_explicit() {
+        let mut memory = fixture("owt_1_2_3");
+        memory.method = Some(Method::Rule("preference-v1".to_owned()));
+        let record = MemoryRecord::from_new(
+            &memory.validate().unwrap(),
+            Scope::User,
+            "2026-09-18T10:00:00Z",
+        );
+        assert_eq!(
+            record.method,
+            Some(Method::Rule("preference-v1".to_owned()))
+        );
+        let line = record.to_json_line();
+        assert!(line.contains("\"method\":\"rule:preference-v1\""));
+        let parsed = record_from_line(&line, Scope::User).expect("round-trips");
+        assert_eq!(parsed, record);
+        // Pre-8 line without the field loads with method None (= explicit).
+        let legacy = r#"{"v":1,"id":"owt_1_2_3","kind":"fact","scope":"user","content":"x","source":"user","status":"ACTIVE","pinned":false,"created_at":"2026-09-18T10:00:00Z","updated_at":"2026-09-18T10:00:00Z","session_id":"ses"}"#;
+        let parsed = record_from_line(legacy, Scope::User).expect("absent tolerated");
+        assert_eq!(parsed.method, None);
+        // Malformed method values are corrupt, like bad enums.
+        for bad in [
+            r#"{"v":1,"id":"owt_1_2_3","kind":"fact","scope":"user","content":"x","source":"user","status":"ACTIVE","pinned":false,"created_at":"2026-09-18T10:00:00Z","updated_at":"2026-09-18T10:00:00Z","session_id":"ses","method":"confidence"}"#,
+            r#"{"v":1,"id":"owt_1_2_3","kind":"fact","scope":"user","content":"x","source":"user","status":"ACTIVE","pinned":false,"created_at":"2026-09-18T10:00:00Z","updated_at":"2026-09-18T10:00:00Z","session_id":"ses","method":42}"#,
+        ] {
+            assert!(record_from_line(bad, Scope::User).is_err());
+        }
+        // Pre-8 serialization has no method key at all (byte-stable files).
+        let plain = fixture("owt_1_2_3").validate().unwrap();
+        let plain_record = MemoryRecord::from_new(&plain, Scope::User, "2026-09-18T10:00:00Z");
+        assert!(!plain_record.to_json_line().contains("method"));
     }
 }

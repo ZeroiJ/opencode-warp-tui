@@ -10,8 +10,9 @@
 
 use super::api::{NewMemoryArgs, ScopeTarget, WriteResult};
 use super::key;
-use super::record::{Kind, MemoryRecord};
+use super::record::{Kind, MemoryRecord, Scope};
 use super::store::{ForgetOutcome, Handle};
+use super::triage;
 
 /// What the adapter should do with a submitted message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,21 @@ pub enum Command {
         all: bool,
         scope: ScopeTarget,
     },
+    /// Phase 8: list quarantined proposals (deterministic order).
+    Suggest,
+    /// Phase 8: confirm a proposal by suggest-index or exact id, with
+    /// optional scope/kind overrides.
+    Confirm {
+        target: triage::Target,
+        scope: Option<Scope>,
+        kind: Option<Kind>,
+    },
+    /// Phase 8: discard by index/id, or `all` (requires `--confirm`).
+    /// `target: None` = all.
+    Discard {
+        target: Option<triage::Target>,
+        confirm_all: bool,
+    },
     Help,
 }
 
@@ -91,6 +107,9 @@ pub fn parse(text: &str) -> Result<Command, String> {
         "unpin" => parse_handle_command(&mut scanner, Some(false)),
         "list" => parse_list(&mut scanner),
         "show" => parse_show(&mut scanner),
+        "suggest" => parse_suggest(&mut scanner),
+        "confirm" => parse_confirm(&mut scanner),
+        "discard" => parse_discard(&mut scanner),
         other => Err(format!(
             "unknown memory command {other:?} — try `/memory help`"
         )),
@@ -187,6 +206,9 @@ fn parse_write(scanner: &mut TokenScanner<'_>, remember: bool) -> Result<Command
         content,
         pinned,
         scope,
+        method: None,
+        quote: None,
+        session_id: None,
     };
     if remember {
         Ok(Command::Remember(args))
@@ -297,6 +319,110 @@ fn parse_show(scanner: &mut TokenScanner<'_>) -> Result<Command, String> {
     Ok(Command::Show { handle, all, scope })
 }
 
+/// A confirm/discard target token: `1`-based suggest index or exact id.
+fn parse_target(token: &str) -> Result<triage::Target, String> {
+    if let Ok(n) = token.parse::<usize>() {
+        if n >= 1 {
+            return Ok(triage::Target::Index(n));
+        }
+        return Err(format!("proposal index {token:?} starts at 1"));
+    }
+    if key::is_id_shape(token) {
+        return Ok(triage::Target::Id(token.to_owned()));
+    }
+    Err(format!(
+        "invalid proposal target {token:?} (want a suggest index or id)"
+    ))
+}
+
+fn parse_suggest(scanner: &mut TokenScanner<'_>) -> Result<Command, String> {
+    if let Some(token) = scanner.next_token() {
+        return Err(format!("unexpected argument {token:?} for suggest"));
+    }
+    Ok(Command::Suggest)
+}
+
+fn parse_confirm(scanner: &mut TokenScanner<'_>) -> Result<Command, String> {
+    let mut scope: Option<Scope> = None;
+    let mut kind: Option<Kind> = None;
+    let mut target = None;
+    loop {
+        let Some(token) = scanner.next_token() else {
+            break;
+        };
+        if let Some(value) = token.strip_prefix("--scope=") {
+            match value {
+                "user" => scope = Some(Scope::User),
+                "project" => scope = Some(Scope::Project),
+                other => return Err(format!("--scope={other:?} (want user or project)")),
+            }
+        } else if let Some(value) = token.strip_prefix("--as=") {
+            match value {
+                "fact" => kind = Some(Kind::Fact),
+                "preference" => kind = Some(Kind::Preference),
+                other => return Err(format!("--as={other:?} (want fact or preference)")),
+            }
+        } else if token.starts_with("--") {
+            return Err(format!("unknown flag {token:?}"));
+        } else {
+            if target.is_some() {
+                return Err(format!("unexpected argument {token:?}"));
+            }
+            target = Some(parse_target(token)?);
+        }
+    }
+    let Some(target) = target else {
+        return Err("missing <n|id> — try `/memory confirm 1`".into());
+    };
+    Ok(Command::Confirm {
+        target,
+        scope,
+        kind,
+    })
+}
+
+fn parse_discard(scanner: &mut TokenScanner<'_>) -> Result<Command, String> {
+    let mut target = None;
+    let mut all = false;
+    let mut confirm_all = false;
+    loop {
+        let Some(token) = scanner.next_token() else {
+            break;
+        };
+        if token == "--confirm" {
+            confirm_all = true;
+        } else if token.starts_with("--") {
+            return Err(format!("unknown flag {token:?}"));
+        } else if token == "all" {
+            if target.is_some() || all {
+                return Err(format!("unexpected argument {token:?}"));
+            }
+            all = true;
+        } else {
+            if target.is_some() || all {
+                return Err(format!("unexpected argument {token:?}"));
+            }
+            target = Some(parse_target(token)?);
+        }
+    }
+    if all {
+        return Ok(Command::Discard {
+            target: None,
+            confirm_all,
+        });
+    }
+    let Some(target) = target else {
+        return Err("missing <n|id|all> — try `/memory discard 1`".into());
+    };
+    if confirm_all {
+        return Err("--confirm is only valid with `discard all`".into());
+    }
+    Ok(Command::Discard {
+        target: Some(target),
+        confirm_all: false,
+    })
+}
+
 /// A handle token: `owt_<millis>_<pid>_<seq>` is an id, anything else is an
 /// exact key.
 fn parse_handle(token: &str) -> Result<Handle, String> {
@@ -383,6 +509,9 @@ pub fn help_text() -> &'static str {
   pin | unpin <key|id>                  [--scope=…]
   list                                  [--scope=…] [--kind=…] [--pinned]
   show <key|id>                         [--all] [--scope=…]
+  suggest                               (quarantined rule proposals — not memories until confirmed)
+  confirm <n|id>                        [--scope=user|project] [--as=fact|preference]
+  discard <n|id|all>                    (`all` needs `--confirm`)
 default scope: user ($XDG_DATA_HOME/owt); project store: <root>/.owt (--scope=project).
 escape: start a message with \\/memory to send it to the agent literally."
 }
@@ -646,6 +775,70 @@ mod tests {
     }
 
     #[test]
+    fn parse_triage_verbs() {
+        assert!(matches!(parse("suggest"), Ok(Command::Suggest)));
+        assert!(parse("suggest extra").is_err());
+        match parse("confirm 2").unwrap() {
+            Command::Confirm {
+                target,
+                scope,
+                kind,
+            } => {
+                assert!(matches!(target, triage::Target::Index(2)));
+                assert!(scope.is_none() && kind.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse("confirm owt_1_2_3 --scope=project --as=preference").unwrap() {
+            Command::Confirm {
+                target,
+                scope,
+                kind,
+            } => {
+                assert!(matches!(target, triage::Target::Id(_)));
+                assert_eq!(scope, Some(Scope::Project));
+                assert_eq!(kind, Some(Kind::Preference));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse("confirm").is_err());
+        assert!(parse("confirm 0").is_err());
+        assert!(parse("confirm abc").is_err());
+        assert!(parse("confirm 1 --as=bogus").is_err());
+        match parse("discard all").unwrap() {
+            Command::Discard {
+                target,
+                confirm_all,
+            } => {
+                assert!(target.is_none() && !confirm_all);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse("discard all --confirm").unwrap() {
+            Command::Discard {
+                target,
+                confirm_all,
+            } => {
+                assert!(target.is_none() && confirm_all);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse("discard 1").unwrap() {
+            Command::Discard {
+                target,
+                confirm_all,
+            } => {
+                assert!(matches!(target, Some(triage::Target::Index(1))));
+                assert!(!confirm_all);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse("discard").is_err());
+        assert!(parse("discard 1 --confirm").is_err());
+        assert!(parse("discard 1 2").is_err());
+    }
+
+    #[test]
     fn replies_reference_ids_never_content_in_error_path() {
         // list_reply truncates long content.
         let record = |content: &str| MemoryRecord {
@@ -662,6 +855,7 @@ mod tests {
             session_id: "ses".into(),
             source_ref: None,
             quote: None,
+            method: None,
         };
         let reply = list_reply(&[record(&"x".repeat(200))]);
         assert!(reply.contains("…"));

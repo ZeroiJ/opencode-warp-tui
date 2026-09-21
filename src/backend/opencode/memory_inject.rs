@@ -299,6 +299,9 @@ mod tests {
                 content: "Prefer Rust for new services.".into(),
                 pinned: false,
                 scope: ScopeTarget::Default,
+                method: None,
+                quote: None,
+                session_id: None,
             },
         )
         .unwrap();

@@ -139,6 +139,7 @@ mod tests {
             session_id: "ses".to_owned(),
             source_ref: None,
             quote: None,
+            method: None,
         }
     }
 

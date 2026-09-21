@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use super::stream::apply_event;
 use super::{
-    memory::{api::ListFilter, command, MemoryApi},
+    memory::{api::ListFilter, command, extract, triage, MemoryApi},
     AgentStatus, Backend, Block, Blocker, FileDiff, Question, SessionSummary, SlashCommand,
     StatusInfo, StreamEvent,
 };
@@ -1109,12 +1109,22 @@ impl Backend for OpenCodeBackend {
     }
 
     fn set_active(&mut self, index: usize) {
+        let leaving = self.with_state(|state| state.active_id());
         let known = self.with_state(|state| index < state.summaries.len());
         if known {
             if let Ok(mut state) = self.state.lock() {
                 state.active = index;
             }
             self.hydrate_active();
+            // Phase 8 (8-R3): leaving a session ends it for extraction
+            // purposes — generate proposals from its history. Silent and
+            // best-effort; the session is never affected.
+            if let Some(left) = leaving {
+                let current = self.with_state(|state| state.active_id());
+                if Some(left.clone()) != current {
+                    self.refresh_proposals(&left);
+                }
+            }
         }
     }
 
@@ -1906,7 +1916,94 @@ impl OpenCodeBackend {
                     },
                 }
             }
+            // Phase 8 proposal triage (8-R12): quarantined suggestions are
+            // refreshed from this session's history first, then listed.
+            Ok(command::Command::Suggest) => {
+                self.refresh_proposals(session_id);
+                match triage::suggest_text(&mut self.memory) {
+                    Ok(text) => Block::Assistant { text },
+                    Err(error) => Block::Error {
+                        text: format!("memory: {error}"),
+                    },
+                }
+            }
+            Ok(command::Command::Confirm {
+                target,
+                scope,
+                kind,
+            }) => match triage::confirm_proposal(&mut self.memory, &target, scope, kind) {
+                Ok(text) => Block::Assistant { text },
+                Err(error) => Block::Error {
+                    text: format!("memory: {error}"),
+                },
+            },
+            Ok(command::Command::Discard {
+                target,
+                confirm_all,
+            }) => match triage::discard_proposal(&mut self.memory, target.as_ref(), confirm_all) {
+                Ok(text) => Block::Assistant { text },
+                Err(error) => Block::Error {
+                    text: format!("memory: {error}"),
+                },
+            },
         }
+    }
+
+    /// Best-effort session-end proposal refresh (Phase 8, 8-R1–R3): read
+    /// this session's user-role history, generate rule proposals into the
+    /// quarantine queues. Silent; any failure only logs — the session is
+    /// never affected (memory-never-fatal invariant).
+    fn refresh_proposals(&mut self, session_id: &str) {
+        let texts = self.session_user_texts(session_id);
+        if texts.is_empty() {
+            return;
+        }
+        let project_rooted = self.memory.has_project();
+        match triage::refresh_session_proposals(&self.memory, session_id, &texts, project_rooted) {
+            Ok(stats) => {
+                if stats.proposed > 0 {
+                    log::info!(
+                        "memory: session {session_id} proposed {} candidate(s)",
+                        stats.proposed
+                    );
+                }
+            }
+            Err(error) => log::warn!("memory: proposal refresh skipped: {error}"),
+        }
+    }
+
+    /// User-role message texts for one session, oldest-first (Phase 8
+    /// input set — 8-R2 is structural: only `type == "user"` messages).
+    fn session_user_texts(&self, session_id: &str) -> Vec<String> {
+        const MAX_PAGES: usize = 50;
+        let mut texts = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let page =
+                match self
+                    .client
+                    .list_messages_paged(session_id, cursor.as_deref(), Some(200))
+                {
+                    Ok(page) => page,
+                    Err(_) => break,
+                };
+            let messages = page
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            texts.extend(extract::user_texts(&messages));
+            cursor = page
+                .get("cursor")
+                .and_then(|cursor| cursor.get("next"))
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        texts
     }
 }
 
@@ -2201,7 +2298,11 @@ mod tests {
     fn test_backend(client: Client) -> OpenCodeBackend {
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = SseWorker::spawn(|| None, sender);
-        let dir = std::env::temp_dir().join(format!("owt-7c-test-{}", std::process::id()));
+        // Unique temp dir per backend: parallel tests must never share
+        // store or quarantine files.
+        static BACKEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = BACKEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("owt-7c-test-{}-{seq}", std::process::id()));
         let state = Arc::new(Mutex::new(state_with_active()));
         // Production invariant: every known session has a blocks entry
         // (created at session creation/hydrate); seed it here.
@@ -2442,5 +2543,50 @@ mod tests {
         let _ = backend.commands();
         let status = backend.status();
         assert!(!status.model.is_empty());
+    }
+
+    /// Wipe the shared temp-dir quarantine queues (the 7C helper shares
+    /// one temp dir per process; proposal state must not leak across
+    /// tests).
+    fn clear_queues() {
+        let dir = std::env::temp_dir().join(format!("owt-7c-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(dir.join("proposals.jsonl"));
+        let _ = std::fs::remove_file(dir.join("discarded.jsonl"));
+    }
+
+    #[test]
+    fn suggest_refreshes_from_stub_history() {
+        clear_queues();
+        let history = r#"{"data":[{"type":"user","text":"Always write adapter tests first."},{"type":"assistant","text":"Never skip documentation."}],"cursor":{"previous":null,"next":null}}"#;
+        let stub = Stub::spawn((200, history.to_owned()));
+        let mut backend = test_backend(stub.client());
+        backend.submit("/memory suggest".into());
+        // The user message proposes; the identical assistant text cannot
+        // (structural user-only input, 8-R2).
+        let text = last_text(&backend);
+        assert!(text.contains("quarantined"), "got: {text}");
+        assert!(text.contains("Always write adapter tests first."));
+        // Exactly one proposal: the assistant echo produced nothing.
+        assert!(!text.contains("2. ["));
+    }
+
+    #[test]
+    fn confirm_stores_and_discard_drops() {
+        clear_queues();
+        let history = r#"{"data":[{"type":"user","text":"Never land untested refactors."}],"cursor":{"previous":null,"next":null}}"#;
+        let stub = Stub::spawn((200, history.to_owned()));
+        let mut backend = test_backend(stub.client());
+        backend.submit("/memory suggest".into());
+        backend.submit("/memory confirm 1".into());
+        let text = last_text(&backend);
+        assert!(text.contains("confirmed"), "got: {text}");
+        assert!(text.contains("method=rule:imperative-v1"), "got: {text}");
+        // Second session, discard path.
+        let history = r#"{"data":[{"type":"user","text":"I prefer tabs everywhere."}],"cursor":{"previous":null,"next":null}}"#;
+        let stub = Stub::spawn((200, history.to_owned()));
+        let mut backend = test_backend(stub.client());
+        backend.submit("/memory suggest".into());
+        backend.submit("/memory discard 1".into());
+        assert!(last_text(&backend).contains("discarded"));
     }
 }
