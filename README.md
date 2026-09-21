@@ -15,8 +15,8 @@ transcript, gates, history, and a growing set of agent operations.
 > validated model/agent switching, server slash-command execution).
 > Test suite: 195 passed / 1 ignored; PTY harness 18/18 green.
 > Phase 8 (memory intelligence) and Phase 9 (memory UX) are
-> **research-only** so far. See `phases.md` (note: its status table can
-> lag the `PHASE*_COMPLETE.md` reports) and `ARCHITECTURE.md`.
+> **research-only** so far. See `docs/phases.md` (note: its status table can
+> lag the `docs/phases/PHASE*_COMPLETE.md` reports) and `docs/ARCHITECTURE.md`.
 
 ## Why does this exist?
 
@@ -176,15 +176,16 @@ So yes, the scope escaped containment.
 ## Current development status
 
 Phases 1–5, 6B, 7B, 7C are implemented and verified (see
-`PHASE6B_COMPLETE.md`, `PHASE7B_COMPLETE.md`, `PHASE7C_COMPLETE.md`).
+`docs/phases/PHASE6B_COMPLETE.md`, `docs/phases/PHASE7B_COMPLETE.md`,
+`docs/phases/PHASE7C_COMPLETE.md`).
 Phase discipline is strict: no phase starts without explicit
 authorization, and `~/warp` (the reference checkout) is never modified.
 The canonical rules live in `AGENTS.md`.
 
 ## Where should a contributor start reading?
 
-1. This file, then `PROJECT_ORIGIN.md`, then `ARCHITECTURE.md`.
-2. `phases.md` (roadmap + per-phase records) and `AGENTS.md` (working rules).
+1. This file, then `docs/PROJECT_ORIGIN.md`, then `docs/ARCHITECTURE.md`.
+2. `docs/phases.md` (roadmap + per-phase records) and `AGENTS.md` (working rules).
 3. `src/backend/mod.rs` (the trait — the single most important file),
    `src/backend/mock.rs`, `src/backend/opencode/`, `src/backend/memory/`.
 4. `src/tui/session.rs` (composition root of the UI), `src/tui/transcript.rs`.

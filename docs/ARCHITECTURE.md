@@ -122,12 +122,12 @@ way, once per session: engine → budget → PUT `owt.memory` → frozen.
 
 ## Where to start
 
-1. `README.md` — what this is and how to run it.
+1. `../README.md` — what this is and how to run it.
 2. `PROJECT_ORIGIN.md` — how it grew here.
 3. This file — how it fits together.
-4. `phases.md` + `AGENTS.md` — roadmap records and working rules (note:
-   the phases status table can lag the `PHASE*_COMPLETE.md` reports;
-   trust the reports for what was actually verified).
+4. `phases.md` + `../AGENTS.md` — roadmap records and working rules (note:
+   the phases status table can lag the `PHASE*_COMPLETE.md` reports in
+   `phases/`; trust the reports for what was actually verified).
 5. Source, in this order: `src/backend/mod.rs` → `src/backend/mock.rs`
    → `src/backend/opencode/` → `src/backend/memory/` →
    `src/tui/session.rs` → `src/tui/transcript.rs`.

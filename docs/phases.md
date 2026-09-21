@@ -360,11 +360,18 @@ Complete whatever remains from the Phase 4 report: questions, permissions,
 tools, shell, files, diffs, cancellation, errors, session history,
 reconnect behavior.
 
-### Phase 8 — Memory Intelligence — ⏳ PLANNED
+### Phase 8 — Memory Intelligence — ⏳ PLANNED (research ✅ COMPLETE)
 
 Automatic extraction, consolidation, semantic/hybrid retrieval, entity
 relationships, temporal reasoning, contradiction detection, confidence
 scoring, decay, relevance scoring. Not prematurely.
+
+Phase 8 research complete (`research/memory/phase8-{recon,decision-log,
+architecture,retrieval-design,intelligence-design,security-review}.md`):
+verdict is deterministic user-gated intelligence, no new deps, no
+embeddings, no LLM requirement — see the Phase 8 Implementation Gate in
+`phase8-recon.md` §10. Implementation starts only on explicit
+authorization.
 
 ### Phase 9 — TUI Memory UX — ⏳ PLANNED
 

@@ -2,8 +2,8 @@
 
 This is the story of how a weekend-sized idea — a nicer TUI for OpenCode —
 turned into a multi-phase agent-systems experiment. Every stage below is
-traceable in the repository: git history, `phases.md`, the `research/`
-decision logs, and the `PHASE*_COMPLETE.md` reports.
+traceable in the repository: git history, `phases.md` (now `docs/phases.md`),
+the `research/` decision logs, and the `docs/phases/PHASE*_COMPLETE.md` reports.
 
 ## Stage 1 — A simple idea
 
