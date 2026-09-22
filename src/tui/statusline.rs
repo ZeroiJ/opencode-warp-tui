@@ -81,6 +81,13 @@ impl StatuslineElement {
             }
         }
         let backend = self.backend.borrow();
+        // A live gate names its keys (digits are undiscoverable otherwise).
+        if backend.blocker().is_some() {
+            return (
+                "1–9 answer blocking prompt".to_owned(),
+                self.theme.accent_text_style(),
+            );
+        }
         // While the agent works, the footer names the attach key (Warp's
         // long-running-command input-slot hint).
         if backend.agent_status() == AgentStatus::Working {

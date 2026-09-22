@@ -180,6 +180,60 @@ pub fn block_rows(theme: Theme, block: &Block) -> Vec<TxRow> {
         .collect()
 }
 
+/// Visual-row threshold above which a shell/diff/thinking block folds
+/// under the collapse-all toggle (Warp folds long sections; per-block
+/// targeting needs cursor infrastructure OWT doesn't have, so one global
+/// `ctrl-e` toggle). Counts logical (pre-wrap) rows — a conservative
+/// under-count, so marginal blocks stay expanded.
+pub const COLLAPSE_THRESHOLD_ROWS: usize = 40;
+
+/// Block rows with collapse-all applied: long shell/diff/thinking blocks
+/// fold to their header row plus a marker naming the toggle. Everything
+/// else passes through untouched.
+pub fn collapse_block_rows(theme: Theme, block: &Block, collapse_all: bool) -> Vec<TxRow> {
+    let rows = block_rows(theme, block);
+    let collapsible = matches!(
+        block,
+        Block::Shell { .. } | Block::Edits { .. } | Block::Thinking { .. }
+    );
+    if !collapse_all || !collapsible || rows.len() <= COLLAPSE_THRESHOLD_ROWS {
+        return rows;
+    }
+    let hidden = rows.len() - 1;
+    let mut folded = Vec::with_capacity(2);
+    if let Some(header) = rows.into_iter().next() {
+        folded.push(header);
+    }
+    folded.push(TxRow::Text(vec![(
+        format!("… {hidden} rows hidden — ctrl-e to expand"),
+        theme.dim_text_style(),
+    )]));
+    folded
+}
+
+/// Empty-transcript zero state: what to do, how to start, where to look.
+/// Quiet by design — four muted rows under no header chrome.
+pub fn zero_state_rows(theme: Theme) -> Vec<TxRow> {
+    vec![
+        TxRow::Text(vec![(
+            "Ask anything to get started.".to_owned(),
+            theme.primary_text_style().add_modifier(Modifier::BOLD),
+        )]),
+        TxRow::Text(vec![(
+            "Type a message + enter to submit · ! prefix runs shell".to_owned(),
+            theme.muted_text_style(),
+        )]),
+        TxRow::Text(vec![(
+            "/ for commands · /model and /agent switch backends".to_owned(),
+            theme.muted_text_style(),
+        )]),
+        TxRow::Text(vec![(
+            "? shortcuts · ctrl-o new session · ctrl-e fold long output".to_owned(),
+            theme.muted_text_style(),
+        )]),
+    ]
+}
+
 /// Render one block into rows (without the leading blank separator).
 fn block_rows_inner(theme: Theme, block: &Block) -> Vec<TxRow> {
     match block {
@@ -486,6 +540,68 @@ mod tests {
             .collect();
         assert!(flat.contains("owned"));
         assert!(!flat.contains('\x1b'));
+    }
+
+    #[test]
+    fn collapse_folds_long_shell_blocks() {
+        use super::{collapse_block_rows, COLLAPSE_THRESHOLD_ROWS};
+        let run = crate::backend::ShellRun {
+            command: "ls".into(),
+            output: (0..50).map(|i| format!("line {i}")).collect(),
+            state: ToolState::Done,
+        };
+        let block = Block::Shell { run };
+        let expanded = collapse_block_rows(Theme, &block, false);
+        assert!(expanded.len() > COLLAPSE_THRESHOLD_ROWS);
+        let folded = collapse_block_rows(Theme, &block, true);
+        assert_eq!(folded.len(), 2);
+        match &folded[1] {
+            TxRow::Text(spans) => assert!(spans[0].0.contains("hidden")),
+            other => panic!("expected marker row, got {other:?}"),
+        }
+        // Short blocks and other kinds pass through even when folding
+        // (no marker row).
+        let short = Block::Shell {
+            run: crate::backend::ShellRun {
+                command: "ls".into(),
+                output: vec!["a".into()],
+                state: ToolState::Done,
+            },
+        };
+        let short_rows = collapse_block_rows(Theme, &short, true);
+        assert_eq!(short_rows.len(), 2);
+        let flat_short: String = short_rows
+            .iter()
+            .filter_map(|row| match row {
+                TxRow::Text(spans) => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|(text, _)| text.clone())
+            .collect();
+        assert!(!flat_short.contains("hidden"));
+        let user = Block::User { text: "hi".into() };
+        assert_eq!(collapse_block_rows(Theme, &user, true).len(), 1);
+    }
+
+    #[test]
+    fn zero_state_names_next_actions() {
+        use super::zero_state_rows;
+        let rows = zero_state_rows(Theme);
+        assert_eq!(rows.len(), 4);
+        let flat: String = rows
+            .iter()
+            .filter_map(|row| match row {
+                TxRow::Text(spans) => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|(text, _)| text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in ["started", "/model", "shortcuts"] {
+            assert!(flat.contains(needle), "missing {needle}: {flat}");
+        }
     }
 
     #[test]

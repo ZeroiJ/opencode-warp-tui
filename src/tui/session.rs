@@ -18,9 +18,9 @@ use warpui_core::{
 };
 
 use super::menus::{render_menu, SlashMenu};
-use super::prompt::{PromptElement, PromptState};
+use super::prompt::{PromptElement, PromptHistory, PromptState};
 use super::statusline::StatuslineElement;
-use super::transcript::{block_rows, row_element, wrap_spans, TxRow};
+use super::transcript::{collapse_block_rows, row_element, wrap_spans, zero_state_rows, TxRow};
 use super::widgets::{
     format_tui_first_column, tui_two_column_layout, ExitConfirmation, TransientHint,
     TransientHintTone, TuiLink, TuiTab, TuiTabBarConfig, TuiTabBarNavigationDirection,
@@ -43,6 +43,11 @@ pub enum PromptEdit {
     Down,
     Home,
     End,
+    WordBack,
+    WordForward,
+    KillToStart,
+    KillToEnd,
+    KillWordBack,
 }
 
 /// Transcript scroll requests.
@@ -68,6 +73,10 @@ pub enum SessionAction {
     Submit,
     Menu(MenuNav),
     Scroll(ScrollDelta),
+    /// Recall an older (`-1`) or newer (`+1`) submitted prompt, or scroll
+    /// when no history applies (single-line prompt, empty ring, gate live).
+    History(i32),
+    ToggleCollapse,
     QuitOrCancel,
     ToggleHelp,
     DismissTop,
@@ -112,6 +121,8 @@ pub struct TranscriptBody {
     help: bool,
     scroll: usize,
     pinned: bool,
+    /// Fold every long shell/diff/thinking block to its header row.
+    collapse_all: bool,
     viewport: Rc<Cell<usize>>,
     total_rows: Rc<Cell<usize>>,
     hint_deadline: Rc<Cell<Option<Instant>>>,
@@ -121,7 +132,13 @@ pub struct TranscriptBody {
 }
 
 impl TranscriptBody {
-    fn new(shared: &ViewShared, help: bool, scroll: usize, pinned: bool) -> Self {
+    fn new(
+        shared: &ViewShared,
+        help: bool,
+        scroll: usize,
+        pinned: bool,
+        collapse_all: bool,
+    ) -> Self {
         Self {
             backend: shared.backend.clone(),
             theme: shared.theme,
@@ -129,6 +146,7 @@ impl TranscriptBody {
             help,
             scroll,
             pinned,
+            collapse_all,
             viewport: shared.viewport.clone(),
             total_rows: shared.total_rows.clone(),
             hint_deadline: shared.hint_deadline.clone(),
@@ -147,11 +165,15 @@ impl TranscriptBody {
         let Some(summary) = summaries.get(backend.active()) else {
             return Vec::new();
         };
+        let blocks = backend.session_blocks(&summary.id);
+        if blocks.is_empty() {
+            return zero_state_rows(self.theme);
+        }
         let mut rows = Vec::new();
-        for block in &backend.session_blocks(&summary.id) {
+        for block in blocks.iter() {
             // One blank row above every block (Warp's BLOCK_TOP_PADDING_ROWS).
             rows.push(TxRow::Text(Vec::new()));
-            rows.extend(block_rows(self.theme, block));
+            rows.extend(collapse_block_rows(self.theme, block, self.collapse_all));
         }
         // Wrap logical rows into visual single-line rows at the known width.
         let mut visual = Vec::with_capacity(rows.len());
@@ -242,13 +264,25 @@ fn help_rows() -> Vec<TxRow> {
     // concrete width, so help content is fixed single-column rows here and
     // the column layout is demonstrated with pre-split label/detail pairs.
     let pairs = [
-        ("wheel · pgup/pgdn · ↑/↓", "scroll transcript"),
+        (
+            "wheel · pgup/pgdn",
+            "scroll transcript (↑/↓ scroll when no history)",
+        ),
+        ("↑/↓", "prompt history · menu navigate · transcript scroll"),
         ("enter", "submit prompt"),
         ("ctrl-j · shift-enter", "newline in prompt"),
         ("←/→ · home/end", "move cursor (across lines)"),
+        (
+            "alt-b/alt-f · ctrl-u/k/w",
+            "word jump · kill to start/end/word",
+        ),
         ("/", "slash-command menu"),
         ("tab · ↑/↓ · esc", "menu accept · navigate · close"),
-        ("1 / 2 / 3", "answer blocking prompt"),
+        ("1–9", "answer blocking prompt"),
+        (
+            "ctrl-e",
+            "fold/unfold long shell, diff, and thinking output",
+        ),
         ("ctrl-p · ctrl-n", "previous / next session"),
         ("ctrl-o", "new session"),
         ("ctrl-t", "simulate agent activity"),
@@ -290,6 +324,10 @@ pub struct SessionView {
     /// Real Warp tab strip hosted as an App child view.
     tab_bar: ViewHandle<TuiTabBarView>,
     prompt: Rc<RefCell<PromptState>>,
+    /// Submitted-prompt history ring (up/down recall on single-line input).
+    history: PromptHistory,
+    /// Collapse-all toggle for long shell/diff/thinking output.
+    collapse_all: Cell<bool>,
     menu_open: Rc<Cell<bool>>,
     menu_selected: Cell<usize>,
     menu_query: RefCell<String>,
@@ -329,6 +367,8 @@ impl SessionView {
             link: TuiLink::default(),
             tab_bar,
             prompt: Rc::new(RefCell::new(PromptState::new())),
+            history: PromptHistory::default(),
+            collapse_all: Cell::new(false),
             menu_open: Rc::new(Cell::new(false)),
             menu_selected: Cell::new(0),
             menu_query: RefCell::new(String::new()),
@@ -348,15 +388,26 @@ impl SessionView {
 
     /// Tab-strip configuration derived from backend sessions. Keys are stable
     /// session ids, so the strip survives renames and insertions. Labels are
-    /// capped so one long title cannot crowd out its neighbors.
+    /// capped so one long title cannot crowd out its neighbors. The active
+    /// tab carries a working dot while the agent runs (per-session busy
+    /// isn't exposed by the trait — only the active session's state).
     pub fn tab_config(backend: &dyn Backend) -> TuiTabBarConfig {
+        use crate::backend::AgentStatus;
         let summaries = backend.session_summaries();
+        let active = backend.active();
+        let working = backend.agent_status() == AgentStatus::Working;
         let mut config = TuiTabBarConfig::new(
             summaries
                 .iter()
-                .map(|session| {
-                    TuiTab::new(session.id.clone(), session.title.clone())
-                        .with_max_label_columns(24)
+                .enumerate()
+                .map(|(index, session)| {
+                    let tab = TuiTab::new(session.id.clone(), session.title.clone())
+                        .with_max_label_columns(24);
+                    if index == active && working {
+                        tab.with_trailing_text(" ●", Theme.attention_glyph_style())
+                    } else {
+                        tab
+                    }
                 })
                 .collect(),
         );
@@ -505,6 +556,7 @@ impl TuiView for SessionView {
                 self.show_help.get(),
                 self.scroll_rows,
                 self.scroll_pinned,
+                self.collapse_all.get(),
             )
             .finish(),
         );
@@ -573,14 +625,14 @@ impl TuiView for SessionView {
                 if menu_up.get() {
                     ctx.dispatch_typed_action(SessionAction::Menu(MenuNav::Prev));
                 } else {
-                    ctx.dispatch_typed_action(SessionAction::Scroll(ScrollDelta::Lines(-1)));
+                    ctx.dispatch_typed_action(SessionAction::History(-1));
                 }
             })
             .on_key("down", move |_, ctx, _| {
                 if menu_down.get() {
                     ctx.dispatch_typed_action(SessionAction::Menu(MenuNav::Next));
                 } else {
-                    ctx.dispatch_typed_action(SessionAction::Scroll(ScrollDelta::Lines(1)));
+                    ctx.dispatch_typed_action(SessionAction::History(1));
                 }
             })
             .on_key("?", |_, ctx, _| {
@@ -595,6 +647,11 @@ impl TuiView for SessionView {
             .on_key("tab", |_, ctx, _| {
                 ctx.dispatch_typed_action(SessionAction::Menu(MenuNav::Accept));
             })
+            .on_key("e", |event, ctx, _| {
+                if is_ctrl(event) {
+                    ctx.dispatch_typed_action(SessionAction::ToggleCollapse);
+                }
+            })
             .on_key("1", |_, ctx, _| {
                 ctx.dispatch_typed_action(SessionAction::AnswerQuestion(0));
             })
@@ -603,6 +660,24 @@ impl TuiView for SessionView {
             })
             .on_key("3", |_, ctx, _| {
                 ctx.dispatch_typed_action(SessionAction::AnswerQuestion(2));
+            })
+            .on_key("4", |_, ctx, _| {
+                ctx.dispatch_typed_action(SessionAction::AnswerQuestion(3));
+            })
+            .on_key("5", |_, ctx, _| {
+                ctx.dispatch_typed_action(SessionAction::AnswerQuestion(4));
+            })
+            .on_key("6", |_, ctx, _| {
+                ctx.dispatch_typed_action(SessionAction::AnswerQuestion(5));
+            })
+            .on_key("7", |_, ctx, _| {
+                ctx.dispatch_typed_action(SessionAction::AnswerQuestion(6));
+            })
+            .on_key("8", |_, ctx, _| {
+                ctx.dispatch_typed_action(SessionAction::AnswerQuestion(7));
+            })
+            .on_key("9", |_, ctx, _| {
+                ctx.dispatch_typed_action(SessionAction::AnswerQuestion(8));
             })
             .finish()
     }
@@ -627,6 +702,12 @@ impl TypedActionView for SessionView {
         }
         match action {
             SessionAction::Prompt(edit) => {
+                // Any buffer edit except vertical moves leaves history
+                // navigation (a diverged buffer is fresh input).
+                match edit {
+                    PromptEdit::Up | PromptEdit::Down => {}
+                    _ => self.history.reset(),
+                }
                 let mut prompt = self.prompt.borrow_mut();
                 match edit {
                     PromptEdit::Insert(text) => prompt.insert(text),
@@ -643,6 +724,11 @@ impl TypedActionView for SessionView {
                     }
                     PromptEdit::Home => prompt.move_home(),
                     PromptEdit::End => prompt.move_end(),
+                    PromptEdit::WordBack => prompt.move_word_back(),
+                    PromptEdit::WordForward => prompt.move_word_forward(),
+                    PromptEdit::KillToStart => prompt.kill_to_start(),
+                    PromptEdit::KillToEnd => prompt.kill_to_end(),
+                    PromptEdit::KillWordBack => prompt.kill_word_back(),
                 }
                 ctx.notify();
             }
@@ -658,6 +744,7 @@ impl TypedActionView for SessionView {
                     return;
                 }
                 let text = self.prompt.borrow().text();
+                self.history.push(&text);
                 self.prompt.borrow_mut().clear();
                 self.menu_dismissed_for.borrow_mut().take();
                 self.backend.borrow_mut().submit(text);
@@ -695,6 +782,37 @@ impl TypedActionView for SessionView {
                     }
                 }
                 ctx.notify();
+            }
+            SessionAction::History(delta) => {
+                // Warp-style recall: single-line input navigates submitted
+                // prompts; every other mode keeps scrolling (live gate,
+                // multiline buffer, empty ring all fall through).
+                let single_line = self.prompt.borrow().lines.len() <= 1;
+                let gate_live = self.backend.borrow().blocker().is_some();
+                if single_line && !gate_live {
+                    let current = self.prompt.borrow().text();
+                    if let Some(recall) = self.history.navigate(&current, *delta) {
+                        self.prompt.borrow_mut().set_text(&recall);
+                        ctx.notify();
+                        return;
+                    }
+                }
+                let lines = if *delta < 0 { -1 } else { 1 };
+                self.scroll_by(lines);
+                ctx.notify();
+            }
+            SessionAction::ToggleCollapse => {
+                let collapsed = !self.collapse_all.get();
+                self.collapse_all.set(collapsed);
+                self.post_hint(
+                    if collapsed {
+                        "Folded long output — ctrl-e to expand".to_owned()
+                    } else {
+                        "Expanded long output".to_owned()
+                    },
+                    TransientHintTone::Muted,
+                    ctx,
+                );
             }
             SessionAction::QuitOrCancel => {
                 if !self.prompt.borrow().is_empty() {

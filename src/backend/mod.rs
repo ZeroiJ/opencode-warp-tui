@@ -126,6 +126,26 @@ pub struct SlashCommand {
     pub description: String,
 }
 
+/// OWT-local verbs implemented by both backends' `submit` routing
+/// (Phase 7C operations). Backends append the entries missing from
+/// their own catalog so the slash menu always offers them.
+pub fn local_commands() -> Vec<SlashCommand> {
+    [
+        ("diff", "Show working-tree diff for this session"),
+        ("compact", "Compact session history"),
+        ("fork", "Fork session (optional: before <message>)"),
+        ("revert", "Revert to a message (usage: /revert <message>)"),
+        ("model", "Switch the agent model"),
+        ("agent", "Switch the agent"),
+    ]
+    .map(|(name, description)| SlashCommand {
+        name: name.into(),
+        description: description.into(),
+    })
+    .into_iter()
+    .collect()
+}
+
 /// One session's tab-strip identity (cheap snapshot; blocks come separately).
 #[derive(Clone, Debug)]
 pub struct SessionSummary {

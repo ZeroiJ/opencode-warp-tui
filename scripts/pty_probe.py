@@ -265,6 +265,17 @@ def main():
         and "honors Retry-After" in late_text,
     )
 
+    # Up-arrow recalls the last submitted prompt into the input line.
+    s.send(b"\x1b[A")
+    time.sleep(0.6)
+    rows = s.screen()
+    check(
+        "up-arrow recalls last prompt",
+        any(r == "> stream me please" for r in rows),
+    )
+    s.send(b"\x03")
+    time.sleep(0.4)
+
     # Scenario D: permission gate answers with 1.
     s.send(b"/demo d\r")
     time.sleep(1.2)

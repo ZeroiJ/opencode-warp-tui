@@ -1141,15 +1141,22 @@ impl Backend for OpenCodeBackend {
     }
 
     fn commands(&self) -> Vec<SlashCommand> {
-        let commands = self.with_state(|state| state.commands.clone());
+        let mut commands = self.with_state(|state| state.commands.clone());
         if commands.is_empty() {
-            vec![SlashCommand {
+            commands = vec![SlashCommand {
                 name: "help".into(),
                 description: "List available commands".into(),
-            }]
-        } else {
-            commands
+            }];
         }
+        // OWT-local verbs (`/diff`, `/compact`, …) are handled in
+        // `submit` routing, not server discovery — surface the missing
+        // ones so the menu offers every supported command.
+        for local in super::local_commands() {
+            if !commands.iter().any(|cmd| cmd.name == local.name) {
+                commands.push(local);
+            }
+        }
+        commands
     }
 
     fn status(&self) -> StatusInfo {

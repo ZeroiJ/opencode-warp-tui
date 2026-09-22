@@ -372,7 +372,7 @@ impl Backend for MockBackend {
     }
 
     fn commands(&self) -> Vec<SlashCommand> {
-        vec![
+        let mut commands = vec![
             SlashCommand {
                 name: "build".into(),
                 description: "Build the workspace".into(),
@@ -417,7 +417,15 @@ impl Backend for MockBackend {
                 name: "help".into(),
                 description: "List available commands".into(),
             },
-        ]
+        ];
+        // Phase 7C verbs live in `submit` routing; surface the ones this
+        // catalog doesn't already name so the menu stays honest.
+        for local in super::local_commands() {
+            if !commands.iter().any(|cmd| cmd.name == local.name) {
+                commands.push(local);
+            }
+        }
+        commands
     }
 
     fn status(&self) -> StatusInfo {

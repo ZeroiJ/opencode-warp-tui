@@ -191,6 +191,149 @@ impl PromptState {
     pub fn clear(&mut self) {
         *self = Self::new();
     }
+
+    /// Replace the whole buffer with one line, cursor at the end (history
+    /// recall). Horizontal offsets reset so the line renders from column 0.
+    pub fn set_text(&mut self, text: &str) {
+        let clean = sanitize_inserted(text);
+        let first = clean.split('\n').next().unwrap_or("").to_owned();
+        self.lines = vec![first];
+        self.row = 0;
+        self.col = self.lines[0].chars().count();
+        self.h_offsets = vec![0];
+    }
+
+    fn word_start_before(&self) -> usize {
+        // Whitespace-delimited words: skip blanks left of the cursor, then
+        // the word itself. Simple, predictable, terminal-like.
+        let chars: Vec<char> = self.line_chars(self.row);
+        let mut col = self.col.min(chars.len());
+        while col > 0 && chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        while col > 0 && !chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        col
+    }
+
+    fn word_end_after(&self) -> usize {
+        let chars: Vec<char> = self.line_chars(self.row);
+        let mut col = self.col.min(chars.len());
+        while col < chars.len() && !chars[col].is_whitespace() {
+            col += 1;
+        }
+        while col < chars.len() && chars[col].is_whitespace() {
+            col += 1;
+        }
+        col
+    }
+
+    pub fn move_word_back(&mut self) {
+        self.col = self.word_start_before();
+    }
+
+    pub fn move_word_forward(&mut self) {
+        self.col = self.word_end_after();
+    }
+
+    /// Delete from the cursor to the start of the current line.
+    pub fn kill_to_start(&mut self) {
+        let byte = self.byte_of(self.row, self.col);
+        self.lines[self.row].drain(..byte);
+        self.col = 0;
+    }
+
+    /// Delete from the cursor to the end of the current line.
+    pub fn kill_to_end(&mut self) {
+        let byte = self.byte_of(self.row, self.col);
+        self.lines[self.row].drain(byte..);
+    }
+
+    /// Delete the word before the cursor (whitespace-delimited).
+    pub fn kill_word_back(&mut self) {
+        let start = self.word_start_before();
+        let from = self
+            .line_chars(self.row)
+            .iter()
+            .take(start)
+            .map(|c| c.len_utf8())
+            .sum();
+        let to = self.byte_of(self.row, self.col);
+        self.lines[self.row].drain(from..to);
+        self.col = start;
+    }
+}
+
+/// Submitted-prompt history ring (Warp's up-arrow recall, in-memory only;
+/// disk persistence stays a Phase 10 concern).
+#[derive(Clone, Debug, Default)]
+pub struct PromptHistory {
+    entries: Vec<String>,
+    /// Position while navigating (`None` = editing fresh input).
+    cursor: Option<usize>,
+    /// Buffer text stashed when navigation starts (restored past newest).
+    draft: String,
+}
+
+/// Ring capacity: enough for a long session, small enough to stay trivial.
+const HISTORY_CAP: usize = 100;
+
+impl PromptHistory {
+    /// Record a submission. Empty/whitespace and repeats of the newest
+    /// entry are skipped; overflow drops the oldest.
+    pub fn push(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.entries.last().is_some_and(|last| last == trimmed) {
+            self.reset();
+            return;
+        }
+        self.entries.push(trimmed.to_owned());
+        while self.entries.len() > HISTORY_CAP {
+            self.entries.remove(0);
+        }
+        self.reset();
+    }
+
+    /// Leave navigation mode (call on any buffer edit or submit).
+    pub fn reset(&mut self) {
+        self.cursor = None;
+        self.draft.clear();
+    }
+
+    /// Step older (`delta < 0`) or newer (`delta > 0`). Returns the buffer
+    /// text to show, or `None` when there is no history to navigate (the
+    /// caller keeps existing behavior, e.g. transcript scroll).
+    pub fn navigate(&mut self, current: &str, delta: i32) -> Option<String> {
+        if self.entries.is_empty() || delta == 0 {
+            return None;
+        }
+        if self.cursor.is_none() {
+            self.draft = current.to_owned();
+            self.cursor = if delta < 0 {
+                Some(self.entries.len() - 1)
+            } else {
+                // Down with no navigation active: nothing newer than the
+                // draft — stay put so down-arrow keeps scrolling.
+                return None;
+            };
+        } else if delta < 0 {
+            let cursor = self.cursor.unwrap_or(0).saturating_sub(1);
+            self.cursor = Some(cursor);
+        } else {
+            let next = self.cursor.unwrap_or(0) + 1;
+            if next >= self.entries.len() {
+                let draft = std::mem::take(&mut self.draft);
+                self.cursor = None;
+                return Some(draft);
+            }
+            self.cursor = Some(next);
+        }
+        Some(self.entries[self.cursor.unwrap_or(0)].clone())
+    }
 }
 
 /// Multiline prompt element: `> buffer` with hardware cursor.
@@ -385,6 +528,31 @@ impl TuiElement for PromptElement {
             event_ctx.dispatch_typed_action(SessionAction::prompt_edit(PromptEdit::Newline));
             return true;
         }
+        // Word motion and line kills (readline-style, applied once via the
+        // session action — unlike arrows, which the element pre-applies).
+        if keystroke.alt && !keystroke.ctrl && !keystroke.cmd {
+            let edit = match keystroke.key.as_str() {
+                "b" => Some(PromptEdit::WordBack),
+                "f" => Some(PromptEdit::WordForward),
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                event_ctx.dispatch_typed_action(SessionAction::prompt_edit(edit));
+                return true;
+            }
+        }
+        if keystroke.ctrl && !keystroke.alt && !keystroke.cmd {
+            let edit = match keystroke.key.as_str() {
+                "u" => Some(PromptEdit::KillToStart),
+                "k" => Some(PromptEdit::KillToEnd),
+                "w" => Some(PromptEdit::KillWordBack),
+                _ => None,
+            };
+            if let Some(edit) = edit {
+                event_ctx.dispatch_typed_action(SessionAction::prompt_edit(edit));
+                return true;
+            }
+        }
         if keystroke.ctrl || keystroke.alt || keystroke.cmd {
             return false;
         }
@@ -394,7 +562,9 @@ impl TuiElement for PromptElement {
         if self.menu_open.get() || blocker_live {
             match keystroke.key.as_str() {
                 "enter" | "escape" | "up" | "down" | "tab" => return false,
-                "1" | "2" | "3" if blocker_live => return false,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" if blocker_live => {
+                    return false
+                }
                 _ => {}
             }
         }
@@ -472,6 +642,19 @@ mod tests {
         TuiEvent::KeyDown {
             keystroke: keystroke(key, ctrl, shift),
             chars: chars.to_owned(),
+            details: KeyEventDetails::default(),
+            is_composing: false,
+        }
+    }
+
+    fn alt_key_event(key: &str) -> TuiEvent {
+        TuiEvent::KeyDown {
+            keystroke: Keystroke {
+                key: key.to_owned(),
+                alt: true,
+                ..Default::default()
+            },
+            chars: String::new(),
             details: KeyEventDetails::default(),
             is_composing: false,
         }
@@ -621,6 +804,51 @@ mod tests {
     }
 
     #[test]
+    fn word_and_kill_keys_are_consumed() {
+        with_app(|app_ctx| {
+            // alt-b / alt-f word motion.
+            assert!(dispatch(
+                &alt_key_event("b"),
+                false,
+                fresh_backend(),
+                app_ctx
+            ));
+            assert!(dispatch(
+                &alt_key_event("f"),
+                false,
+                fresh_backend(),
+                app_ctx
+            ));
+            // ctrl-u / ctrl-k / ctrl-w line kills.
+            for key in ["u", "k", "w"] {
+                assert!(
+                    dispatch(
+                        &key_event(key, "", true, false),
+                        false,
+                        fresh_backend(),
+                        app_ctx
+                    ),
+                    "{key} should be consumed as a line kill"
+                );
+            }
+            // Other ctrl combos still fall through to the session handler.
+            assert!(!dispatch(
+                &key_event("x", "", true, false),
+                false,
+                fresh_backend(),
+                app_ctx
+            ));
+            // Other alt combos fall through untouched.
+            assert!(!dispatch(
+                &alt_key_event("x"),
+                false,
+                fresh_backend(),
+                app_ctx
+            ));
+        });
+    }
+
+    #[test]
     fn insert_and_move() {
         let mut prompt = PromptState::new();
         prompt.insert("hi");
@@ -692,5 +920,62 @@ mod tests {
         // Up-arrow binding (Lines(-1), toward older rows).
         assert!(wheel_lines((0, 1)) < 0);
         assert!(wheel_lines((0, -1)) > 0);
+    }
+
+    #[test]
+    fn history_ring_push_dedups_and_caps() {
+        use super::PromptHistory;
+        let mut history = PromptHistory::default();
+        assert_eq!(history.navigate("", -1), None);
+        history.push("  ");
+        history.push("one");
+        history.push("one");
+        history.push("two");
+        assert_eq!(history.navigate("", -1), Some("two".to_owned()));
+        assert_eq!(history.navigate("", -1), Some("one".to_owned()));
+        // Past the oldest: stays on the oldest entry.
+        assert_eq!(history.navigate("", -1), Some("one".to_owned()));
+        // Past the newest: restores the stashed draft ("" here, stashed
+        // when navigation started).
+        assert_eq!(history.navigate("", 1), Some("two".to_owned()));
+        assert_eq!(history.navigate("ignored", 1), Some(String::new()));
+        // Draft restore exits navigation; older starts from the top again.
+        assert_eq!(history.navigate("", -1), Some("two".to_owned()));
+        history.reset();
+        assert_eq!(history.navigate("", 1), None);
+    }
+
+    #[test]
+    fn history_ring_bounded() {
+        use super::{PromptHistory, HISTORY_CAP};
+        let mut history = PromptHistory::default();
+        for i in 0..(HISTORY_CAP + 10) {
+            history.push(&format!("entry {i}"));
+        }
+        assert_eq!(history.navigate("", -1).as_deref(), Some("entry 109"));
+    }
+
+    #[test]
+    fn word_motion_and_kills() {
+        let mut prompt = PromptState::new();
+        prompt.insert("one two three");
+        prompt.move_word_back();
+        assert_eq!(prompt.col, 8);
+        prompt.move_word_back();
+        assert_eq!(prompt.col, 4);
+        prompt.move_word_forward();
+        assert_eq!(prompt.col, 8);
+        prompt.kill_word_back();
+        assert_eq!(prompt.text(), "one three");
+        prompt.move_end();
+        prompt.kill_to_start();
+        assert_eq!(prompt.text(), "");
+        prompt.insert("abc def");
+        prompt.move_home();
+        prompt.kill_to_end();
+        assert_eq!(prompt.text(), "");
+        prompt.set_text("hello world");
+        assert_eq!(prompt.text(), "hello world");
+        assert_eq!(prompt.col, 11);
     }
 }
